@@ -44,10 +44,10 @@ static const char INDEX_HTML[] = R"rawliteral(
     <form onsubmit="return setPara(event)">
       <label>Pos (deg)</label>
       <input type="number" step="any" name="pos" id="pos" value="180">
-      <label>Spd</label>
-      <input type="number" name="spd" id="spd" value="2000">
-      <label>RPA</label>
-      <input type="number" name="rpa" id="rpa" value="2000">
+      <label>Spd (-40000..40000)</label>
+      <input type="number" name="spd" id="spd" value="2000" min="-40000" max="40000">
+      <label>RPA (0..60000)</label>
+      <input type="number" name="rpa" id="rpa" value="2000" min="0" max="60000">
       <label>Approach Pos time (ms)</label>
       <input type="number" name="approach_pos" id="approach_pos" value="3000" min="50">
       <label>Approach Zero time (ms)</label>

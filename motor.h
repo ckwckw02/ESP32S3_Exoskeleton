@@ -108,7 +108,10 @@ void comm_can_set_origin(uint8_t controller_id, uint8_t set_origin_mode) {
 }
 
 //位置速度环模式
-void comm_can_set_pos_spd(uint8_t controller_id, float pos, int16_t spd, int16_t RPA) {
+// spd range: -40000..40000, RPA range: 0..60000 (int32_t on the ESP32 side).
+// On the CAN wire they are scaled by /10 into int16 fields (max 4000/6000),
+// so the bus format is unchanged.
+void comm_can_set_pos_spd(uint8_t controller_id, float pos, int32_t spd, int32_t RPA) {
   int32_t send_index = 0;
   int32_t send_index1 = 4;
   uint8_t buffer[8];
@@ -151,8 +154,8 @@ void motor_poll(const twai_message_t *msg) {
 // ============================================================================
 typedef struct {
   float    pos;            // target position for the "to Pos" phases (deg)
-  int16_t  spd;            // speed limit shared by both motors
-  int16_t  rpa;            // acceleration limit shared by both motors
+  int32_t  spd;            // speed limit, range -40000..40000
+  int32_t  rpa;            // acceleration limit, range 0..60000
   uint32_t approach_pos_ms;   // max time to wait while approaching target Pos
   uint32_t approach_zero_ms;  // max time to wait while returning to Pos = 0
   uint32_t cooldown_ms;       // idle wait before each "to Pos" phase
@@ -232,7 +235,7 @@ static bool motor_approached(const motor_status_t *st, float target, uint32_t ti
 }
 
 // Send a pos_spd command with CAN TX serialization.
-static void motor_cmd_pos_spd(uint8_t id, float pos, int16_t spd, int16_t rpa) {
+static void motor_cmd_pos_spd(uint8_t id, float pos, int32_t spd, int32_t rpa) {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
   comm_can_set_pos_spd(id, pos, spd, rpa);
   xSemaphoreGive(can_tx_mux);

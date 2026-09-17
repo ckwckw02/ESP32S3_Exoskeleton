@@ -56,8 +56,8 @@ static void handleSetPara() {
   motor_params_get(&p);
 
   if (server.hasArg("pos"))            p.pos = server.arg("pos").toFloat();
-  if (server.hasArg("spd"))            p.spd = (int16_t)constrain(server.arg("spd").toInt(), -32768, 32767);
-  if (server.hasArg("rpa"))            p.rpa = (int16_t)constrain(server.arg("rpa").toInt(), -32768, 32767);
+  if (server.hasArg("spd"))            p.spd = constrain(server.arg("spd").toInt(), -40000, 40000); // Spd: -40000..40000
+  if (server.hasArg("rpa"))            p.rpa = constrain(server.arg("rpa").toInt(), 0, 60000);       // RPA: 0..60000
   if (server.hasArg("approach_pos"))   p.approach_pos_ms = constrain(server.arg("approach_pos").toInt(), 50, 60000);
   if (server.hasArg("approach_zero"))  p.approach_zero_ms = constrain(server.arg("approach_zero").toInt(), 50, 60000);
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
