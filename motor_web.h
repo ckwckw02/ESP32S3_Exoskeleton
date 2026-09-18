@@ -55,15 +55,32 @@ static void handleSetPara() {
   motor_params_t p;
   motor_params_get(&p);
 
+  // "To Pos" group
   if (server.hasArg("pos"))            p.pos = server.arg("pos").toFloat();
-  if (server.hasArg("spd"))            p.spd = constrain(server.arg("spd").toInt(), -40000, 40000); // Spd: -40000..40000
-  if (server.hasArg("rpa"))            p.rpa = constrain(server.arg("rpa").toInt(), 0, 60000);       // RPA: 0..60000
+  if (server.hasArg("spd_pos"))        p.spd_pos  = constrain(server.arg("spd_pos").toInt(), -40000, 40000); // to-Pos Spd: -40000..40000
+  if (server.hasArg("rpa_pos"))        p.rpa_pos  = constrain(server.arg("rpa_pos").toInt(), 0, 60000);       // to-Pos RPA: 0..60000
   if (server.hasArg("approach_pos"))   p.approach_pos_ms = constrain(server.arg("approach_pos").toInt(), 50, 60000);
+  // "To Zero" group
+  if (server.hasArg("spd_zero"))       p.spd_zero = constrain(server.arg("spd_zero").toInt(), -40000, 40000); // to-Zero Spd: -40000..40000
+  if (server.hasArg("rpa_zero"))       p.rpa_zero = constrain(server.arg("rpa_zero").toInt(), 0, 60000);       // to-Zero RPA: 0..60000
   if (server.hasArg("approach_zero"))  p.approach_zero_ms = constrain(server.arg("approach_zero").toInt(), 50, 60000);
+  // shared
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
 
   motor_params_set(&p);
   server.send(200, "text/plain", "params set");
+}
+
+// Toggle the control mode: ?mode=1 -> speed-only loop (comm_can_set_rpm),
+// ?mode=0 -> pos+spd loop (comm_can_set_pos_spd). Takes effect immediately.
+static void handleSetMode() {
+  motor_params_t p;
+  motor_params_get(&p);
+
+  if (server.hasArg("mode")) p.speed_only = (server.arg("mode").toInt() != 0);
+
+  motor_params_set(&p);
+  server.send(200, "text/plain", p.speed_only ? "mode: rpm" : "mode: pos_spd");
 }
 
 static void handleStatus() {
@@ -74,12 +91,18 @@ static void handleStatus() {
   s += "running: ";
   s += g_running ? "YES" : "no";
   s += ", phase: "; s += motor_phase_name();
+  s += ", mode: "; s += p.speed_only ? "RPM (speed-only)" : "POS_SPD (pos+spd)";
   s += "\n";
+  // One field per line so the web page can parse and auto-populate the form.
   s += "pos="; s += p.pos;
-  s += " spd="; s += (int)p.spd;
-  s += " rpa="; s += (int)p.rpa;
-  s += "\n";
-  s += "approach_pos: "; s += p.approach_pos_ms; s += " ms, approach_zero: "; s += p.approach_zero_ms; s += " ms, cooldown: "; s += p.cooldown_ms; s += " ms\n";
+  s += "\nspd_pos="; s += (int)p.spd_pos;
+  s += "\nrpa_pos="; s += (int)p.rpa_pos;
+  s += "\napproach_pos="; s += p.approach_pos_ms;
+  s += "\nspd_zero="; s += (int)p.spd_zero;
+  s += "\nrpa_zero="; s += (int)p.rpa_zero;
+  s += "\napproach_zero="; s += p.approach_zero_ms;
+  s += "\ncooldown="; s += p.cooldown_ms;
+  s += " ms\n";
   s += "L pos="; s += motor_left.motor_pos;
   s += " spd="; s += motor_left.motor_spd;
   s += " cur="; s += motor_left.motor_cur;
@@ -107,6 +130,7 @@ static void webserver_init() {
   server.on("/set_origin_left", HTTP_GET, handleSetOriginLeft);
   server.on("/set_origin_right", HTTP_GET, handleSetOriginRight);
   server.on("/set_para", HTTP_GET, handleSetPara);
+  server.on("/set_mode", HTTP_GET, handleSetMode);
   server.on("/status", HTTP_GET, handleStatus);
   server.begin();
 }

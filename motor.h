@@ -153,21 +153,31 @@ void motor_poll(const twai_message_t *msg) {
 // consistent.
 // ============================================================================
 typedef struct {
-  float    pos;            // target position for the "to Pos" phases (deg)
-  int32_t  spd;            // speed limit, range -40000..40000
-  int32_t  rpa;            // acceleration limit, range 0..60000
-  uint32_t approach_pos_ms;   // max time to wait while approaching target Pos
-  uint32_t approach_zero_ms;  // max time to wait while returning to Pos = 0
+  // --- "To Pos" group (R->Pos and L->Pos phases) ---
+  float    pos;            // target position magnitude (deg), pos+spd mode only
+  int32_t  spd_pos;        // speed for to-Pos phases, range -40000..40000
+  int32_t  rpa_pos;        // acceleration for to-Pos phases, range 0..60000 (pos+spd only)
+  uint32_t approach_pos_ms;   // max time in a "to Pos" phase
+  // --- "To Zero" group (R->0 and L->0 phases, target is always 0) ---
+  int32_t  spd_zero;       // speed for to-Zero phases, range -40000..40000
+  int32_t  rpa_zero;       // acceleration for to-Zero phases (pos+spd only)
+  uint32_t approach_zero_ms;  // max time in a "to Zero" phase
+  // --- shared ---
   uint32_t cooldown_ms;       // idle wait before each "to Pos" phase
+  bool     speed_only;    // false: pos+spd loop (comm_can_set_pos_spd)
+                          // true:  speed-only loop (comm_can_set_rpm), time-based phases
 } motor_params_t;
 
 static motor_params_t g_params = {
   .pos = 180.0f,
-  .spd = 2000,
-  .rpa = 2000,
+  .spd_pos = 2000,
+  .rpa_pos = 2000,
   .approach_pos_ms = 3000,
+  .spd_zero = 2000,
+  .rpa_zero = 2000,
   .approach_zero_ms = 3000,
   .cooldown_ms = 500,
+  .speed_only = false,
 };
 
 // Mutex protecting g_params (web task writes / control task reads)
@@ -199,6 +209,16 @@ static inline void motor_params_set(const motor_params_t *in) {
 //   R -> 0    (wait until approached)
 //   L -> Pos  (cooldown first, wait until approached)
 //   L -> 0    (wait until approached)
+//
+// Two control modes share this sequence:
+//   pos+spd loop : comm_can_set_pos_spd(target, Spd, RPA) to the active motor;
+//                  a phase ends when the position is reached or its time limit
+//                  elapses. Each group (to-Pos / to-Zero) has its own Spd/RPA/time.
+//   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
+//                  comm_can_set_rpm(0) to the other one every cycle (a velocity
+//                  loop holds its last target, so the idle motor must be held).
+//                  Phases are purely time-based: each runs for exactly its group's
+//                  time limit with no position check. Tune |Spd| x time ~= distance.
 // ============================================================================
 typedef enum {
   PHASE_IDLE = 0,
@@ -241,11 +261,19 @@ static void motor_cmd_pos_spd(uint8_t id, float pos, int32_t spd, int32_t rpa) {
   xSemaphoreGive(can_tx_mux);
 }
 
+// Send an rpm (speed-only loop) command with CAN TX serialization.
+static void motor_cmd_rpm(uint8_t id, int32_t rpm) {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_rpm(id, (float)rpm);
+  xSemaphoreGive(can_tx_mux);
+}
+
 // ============================================================================
 // Control task: runs at 100 Hz (CAN RX + TX rate).
 //   - drains all pending TWAI frames into the motor status structs
 //   - advances the movement state machine
-//   - re-sends the active motor's pos_spd command every cycle (100 Hz)
+//   - re-sends the active motor's command every cycle (100 Hz):
+//     pos+spd mode -> comm_can_set_pos_spd; speed-only -> comm_can_set_rpm
 // ============================================================================
 static void control_task(void *arg) {
   twai_message_t rx;
@@ -265,21 +293,23 @@ static void control_task(void *arg) {
         g_phase_start_ms = millis();
       }
 
-      // Determine the active motor and its current target for this phase.
+      // Determine the active motor, its target and which parameter group applies.
       uint8_t id = 0;
       float   target = 0.0f;
+      bool    is_pos_phase = true;   // to-Pos phases use the "pos" param group
+      int32_t cmd_spd = 0, cmd_rpa = 0;
       uint32_t timeout = 0;
       bool    has_target = true;
 
       switch (g_phase) {
         case PHASE_R_TO_POS:
-          id = MOTOR_RIGHT_CAN_ID; target = -p.pos; timeout = p.approach_pos_ms; break; // right uses negative pos
+          id = MOTOR_RIGHT_CAN_ID; target = -p.pos; is_pos_phase = true; break; // right uses negative pos
         case PHASE_R_TO_ZERO:
-          id = MOTOR_RIGHT_CAN_ID; target = 0.0f;   timeout = p.approach_zero_ms; break;
+          id = MOTOR_RIGHT_CAN_ID; target = 0.0f;   is_pos_phase = false; break;
         case PHASE_L_TO_POS:
-          id = MOTOR_LEFT_CAN_ID;  target = p.pos;  timeout = p.approach_pos_ms; break; // left uses positive pos
+          id = MOTOR_LEFT_CAN_ID;  target = p.pos;  is_pos_phase = true; break; // left uses positive pos
         case PHASE_L_TO_ZERO:
-          id = MOTOR_LEFT_CAN_ID;  target = 0.0f;   timeout = p.approach_zero_ms; break;
+          id = MOTOR_LEFT_CAN_ID;  target = 0.0f;   is_pos_phase = false; break;
         default:
           has_target = false;
           break;
@@ -288,8 +318,22 @@ static void control_task(void *arg) {
       if (has_target) {
         const motor_status_t *st = (id == MOTOR_RIGHT_CAN_ID) ? &motor_right : &motor_left;
 
+        // Per-phase speed / acceleration / time limit from the matching group.
+        cmd_spd  = is_pos_phase ? p.spd_pos  : p.spd_zero;
+        cmd_rpa  = is_pos_phase ? p.rpa_pos  : p.rpa_zero;
+        timeout  = is_pos_phase ? p.approach_pos_ms : p.approach_zero_ms;
+
+        // Speed-only mode: signed |Spd| for the current phase, computed before any
+        // transition so a transition cycle still sends the old phase's command.
+        int32_t spd_abs    = cmd_spd < 0 ? -cmd_spd : cmd_spd;
+        int32_t signed_rpm = (g_phase == PHASE_R_TO_POS || g_phase == PHASE_L_TO_ZERO) ? -spd_abs : +spd_abs;
+
         // Phase complete? Advance to the next phase.
-        if (motor_approached(st, target, timeout)) {
+        //   pos+spd mode: position within tolerance OR time limit elapsed.
+        //   speed-only  : purely time-based — the phase runs for exactly its time.
+        bool done = p.speed_only ? ((millis() - g_phase_start_ms) >= timeout)
+                                 : motor_approached(st, target, timeout);
+        if (done) {
           switch (g_phase) {
             case PHASE_R_TO_POS:  g_phase = PHASE_R_TO_ZERO; break;
             case PHASE_R_TO_ZERO: g_phase = PHASE_L_TO_POS;  vTaskDelay(pdMS_TO_TICKS(p.cooldown_ms)); break; // cooldown before L->Pos
@@ -301,10 +345,26 @@ static void control_task(void *arg) {
         }
 
         // --- CAN TX: command the active motor at 100 Hz while its phase runs ---
-        motor_cmd_pos_spd(id, target, p.spd, p.rpa);
+        if (!p.speed_only) {
+          motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
+        } else {
+          // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
+          // L->0 = -|Spd|. The other motor is held at rpm 0 every cycle because a
+          // velocity loop keeps its last commanded target.
+          uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
+          motor_cmd_rpm(id, signed_rpm);
+          motor_cmd_rpm(other_id, 0);
+        }
       }
-    } else {
-      // Not running: park in idle.
+    } else if (g_phase != PHASE_IDLE) {
+      // Stop transition: in speed-only mode the motors would otherwise keep
+      // spinning at their last commanded rpm, so hold both at zero once.
+      motor_params_t p;
+      motor_params_get(&p);
+      if (p.speed_only) {
+        motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
+        motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
+      }
       g_phase = PHASE_IDLE;
     }
 
