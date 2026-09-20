@@ -7,7 +7,7 @@
 #define CAN_RX_PIN GPIO_NUM_4
 
 const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 const twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
 // TX buffer shared by the CAN transmit helpers (serialized via can_tx_mux).
@@ -33,7 +33,7 @@ void comm_can_transmit_eid(uint32_t id, const uint8_t *data, uint8_t len) {
 
 void setup() {
   // put your setup code here, to run once:
-  Serial.begin(921600);
+  Serial.begin(115200);
   Serial.print("\r\Serial init ok\r\n");
 
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {

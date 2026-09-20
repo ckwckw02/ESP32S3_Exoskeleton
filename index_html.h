@@ -52,25 +52,25 @@ static const char INDEX_HTML[] = R"rawliteral(
     <form onsubmit="return setPara(event)">
       <p style="margin:4px 0; font-weight:bold;">To Pos (R&rarr;Pos, L&rarr;Pos)</p>
       <label id="lbl_pos">Pos (deg) &mdash; pos+spd mode only</label>
-      <input type="number" step="any" name="pos" id="pos" value="180">
+      <input type="number" step="any" name="pos" id="pos" value="360">
       <label>Spd (-40000..40000)</label>
-      <input type="number" name="spd_pos" id="spd_pos" value="2000" min="-40000" max="40000">
+      <input type="number" name="spd_pos" id="spd_pos" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_pos">RPA (0..60000) &mdash; pos+spd mode only</label>
-      <input type="number" name="rpa_pos" id="rpa_pos" value="2000" min="0" max="60000">
+      <input type="number" name="rpa_pos" id="rpa_pos" value="60000" min="0" max="60000">
       <label>Approach Pos time (ms)</label>
-      <input type="number" name="approach_pos" id="approach_pos" value="3000" min="50">
+      <input type="number" name="approach_pos" id="approach_pos" value="1000" min="50">
 
       <p style="margin:12px 0 4px; font-weight:bold;">To Zero (R&rarr;0, L&rarr;0)</p>
       <label>Spd (-40000..40000)</label>
-      <input type="number" name="spd_zero" id="spd_zero" value="2000" min="-40000" max="40000">
+      <input type="number" name="spd_zero" id="spd_zero" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_zero">RPA (0..60000) &mdash; pos+spd mode only</label>
-      <input type="number" name="rpa_zero" id="rpa_zero" value="2000" min="0" max="60000">
+      <input type="number" name="rpa_zero" id="rpa_zero" value="60000" min="0" max="60000">
       <label>Approach Zero time (ms)</label>
-      <input type="number" name="approach_zero" id="approach_zero" value="3000" min="50">
+      <input type="number" name="approach_zero" id="approach_zero" value="1000" min="50">
 
       <p style="margin:12px 0 4px; font-weight:bold;">Shared</p>
       <label>Cooldown (ms)</label>
-      <input type="number" name="cooldown" id="cooldown" value="500" min="0">
+      <input type="number" name="cooldown" id="cooldown" value="0" min="0">
       <button class="set" type="submit">Set</button>
     </form>
   </div>
