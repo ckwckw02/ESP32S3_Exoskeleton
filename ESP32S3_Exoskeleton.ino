@@ -2,9 +2,9 @@
 #include "motor.h"
 #include "motor_web.h"
 
-// ESP32-S3 TWAI (CAN) pins - change to match your wiring
-#define CAN_TX_PIN GPIO_NUM_5
-#define CAN_RX_PIN GPIO_NUM_4
+// XIAO ESP32-S3
+#define CAN_TX_PIN GPIO_NUM_4
+#define CAN_RX_PIN GPIO_NUM_5
 
 const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
 const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();

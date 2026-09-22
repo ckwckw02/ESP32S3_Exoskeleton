@@ -235,8 +235,8 @@ static motor_phase_t     g_phase = PHASE_IDLE;
 static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
 
-// Current applied to both motors while tight mode is active.
-#define TIGHT_CURRENT_A 0.5f
+// Duty applied to both motors while tight mode is active (duty loop, 0..1).
+#define TIGHT_DUTY 0.03f
 
 // Position tolerance (deg) used to decide that a motor has "approached" its
 // target. A motor counts as arrived when |pos - target| <= this value OR the
@@ -275,10 +275,10 @@ static void motor_cmd_rpm(uint8_t id, int32_t rpm) {
   xSemaphoreGive(can_tx_mux);
 }
 
-// Send a current-loop command with CAN TX serialization (tight mode).
-static void motor_cmd_current(uint8_t id, float amps) {
+// Send a duty-loop command with CAN TX serialization (tight mode).
+static void motor_cmd_duty(uint8_t id, float duty) {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
-  comm_can_set_current(id, amps);
+  comm_can_set_duty(id, duty);
   xSemaphoreGive(can_tx_mux);
 }
 
@@ -298,10 +298,10 @@ static void control_task(void *arg) {
     }
 
     if (g_tight) {
-      // Tight mode: hold both motors at TIGHT_CURRENT_A continuously.
+      // Tight mode: hold both motors at TIGHT_DUTY continuously.
       // Bypasses the movement state machine while active; it resumes on stop.
-      motor_cmd_current(MOTOR_LEFT_CAN_ID, TIGHT_CURRENT_A);
-      motor_cmd_current(MOTOR_RIGHT_CAN_ID, TIGHT_CURRENT_A);
+      motor_cmd_duty(MOTOR_LEFT_CAN_ID, TIGHT_DUTY);
+      motor_cmd_duty(MOTOR_RIGHT_CAN_ID, TIGHT_DUTY);
     } else if (g_running) {
       motor_params_t p;
       motor_params_get(&p);

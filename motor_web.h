@@ -2,6 +2,7 @@
 #define MOTOR_WEB_H
 
 #include <WiFi.h>
+#include "esp_wifi.h"
 #include <WebServer.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -35,9 +36,9 @@ static void handleStop() {
   server.send(200, "text/plain", "stopped");
 }
 
-// Tight mode: while active the control task streams TIGHT_CURRENT_A (0.5 A) to
-// both motors via comm_can_set_current(). Stop sends a one-shot 0 A so the
-// controllers don't keep holding current after tight mode ends.
+// Tight mode: while active the control task streams TIGHT_DUTY (duty loop) to
+// both motors via comm_can_set_duty(). Stop sends a one-shot duty 0 so the
+// controllers don't keep driving after tight mode ends.
 static void handleTightStart() {
   g_tight = true;
   server.send(200, "text/plain", "tight start");
@@ -46,8 +47,8 @@ static void handleTightStart() {
 static void handleTightStop() {
   g_tight = false;
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
-  comm_can_set_current(MOTOR_LEFT_CAN_ID, 0.0f);
-  comm_can_set_current(MOTOR_RIGHT_CAN_ID, 0.0f);
+  comm_can_set_duty(MOTOR_LEFT_CAN_ID, 0.0f);
+  comm_can_set_duty(MOTOR_RIGHT_CAN_ID, 0.0f);
   xSemaphoreGive(can_tx_mux);
   server.send(200, "text/plain", "tight stop");
 }
@@ -135,9 +136,37 @@ static void handleStatus() {
   server.send(200, "text/plain", s);
 }
 
+// Debug endpoint: list AP-connected stations with RSSI. Polled by the page
+// once per second. Per-station throughput is not exposed by the ESP32 WiFi
+// API, so only MAC + RSSI are available.
+static void handleWifi() {
+  String s;
+  int n = WiFi.softAPgetStationNum();
+  s += "AP: "; s += WIFI_SSID;
+  s += ", clients: "; s += n;
+  s += "\n";
+
+  wifi_sta_list_t sta_list;
+  esp_wifi_ap_get_sta_list(&sta_list);
+
+  for (int i = 0; i < sta_list.num && i < 4; i++) {
+    wifi_sta_info_t sta = sta_list.sta[i];
+    char line[64];
+    snprintf(line, sizeof(line), "sta%d: %02X:%02X:%02X:%02X:%02X:%02X  rssi=%d dBm\n",
+             i + 1,
+             sta.mac[0], sta.mac[1], sta.mac[2],
+             sta.mac[3], sta.mac[4], sta.mac[5],
+             sta.rssi);
+    s += line;
+  }
+  server.send(200, "text/plain", s);
+}
+
 // ---- Init: start the access point and the web server ----
 static void webserver_init() {
   WiFi.mode(WIFI_AP);
+  // Maximize AP transmit power for range (XIAO ESP32-S3).
+  WiFi.setTxPower(WIFI_POWER_21dBm);
   WiFi.softAP(WIFI_SSID, WIFI_PASS);
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
@@ -152,6 +181,7 @@ static void webserver_init() {
   server.on("/set_para", HTTP_GET, handleSetPara);
   server.on("/set_mode", HTTP_GET, handleSetMode);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/wifi", HTTP_GET, handleWifi);
   server.begin();
 }
 

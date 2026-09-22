@@ -37,7 +37,7 @@ static const char INDEX_HTML[] = R"rawliteral(
     <h2>Control Mode</h2>
     <label style="font-weight:normal; display:inline;">
       <input type="checkbox" id="speed_only" onchange="setMode(this.checked)">
-      Speed-only loop (comm_can_set_rpm) &mdash; off = pos+spd loop (comm_can_set_pos_spd)
+      Speed-only
     </label>
   </div>
 
@@ -49,8 +49,8 @@ static const char INDEX_HTML[] = R"rawliteral(
 
   <div class="section">
     <h2>Tight</h2>
-    <button class="start" onclick="cmd('/tight_start')">Start (0.5 A)</button>
-    <button class="stop" onclick="cmd('/tight_stop')">Stop (0 A)</button>
+    <button class="start" onclick="cmd('/tight_start')">Start (duty 0.03)</button>
+    <button class="stop" onclick="cmd('/tight_stop')">Stop (duty 0)</button>
   </div>
 
   <div class="section">
@@ -79,6 +79,11 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="number" name="cooldown" id="cooldown" value="0" min="0">
       <button class="set" type="submit">Set</button>
     </form>
+  </div>
+
+  <div class="section">
+    <h2>Wi-Fi AP clients (debug)</h2>
+    <div class="status" id="wifi" style="margin-top:0;">loading...</div>
   </div>
 
   <div class="status" id="status">Status: loading...</div>
@@ -144,6 +149,14 @@ static const char INDEX_HTML[] = R"rawliteral(
         })
         .catch(function () {});
     }, 100);
+
+    // Debug: refresh the AP client list once per second.
+    setInterval(function () {
+      fetch('/wifi')
+        .then(function (r) { return r.text(); })
+        .then(function (t) { document.getElementById('wifi').textContent = t; })
+        .catch(function () {});
+    }, 1000);
   </script>
 </body>
 </html>
