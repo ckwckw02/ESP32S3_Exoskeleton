@@ -169,14 +169,14 @@ typedef struct {
 } motor_params_t;
 
 static motor_params_t g_params = {
-  .pos = 180.0f,
-  .spd_pos = 2000,
-  .rpa_pos = 2000,
-  .approach_pos_ms = 3000,
-  .spd_zero = 2000,
-  .rpa_zero = 2000,
-  .approach_zero_ms = 3000,
-  .cooldown_ms = 500,
+  .pos = 360.0f,
+  .spd_pos = 40000,
+  .rpa_pos = 60000,
+  .approach_pos_ms = 1000,
+  .spd_zero = 40000,
+  .rpa_zero = 60000,
+  .approach_zero_ms = 1000,
+  .cooldown_ms = 0,
   .speed_only = false,
 };
 
@@ -226,11 +226,17 @@ typedef enum {
   PHASE_R_TO_ZERO,
   PHASE_L_TO_POS,
   PHASE_L_TO_ZERO,
+  PHASE_COOLDOWN,   // non-blocking idle gap between cycles (keeps sending holds)
 } motor_phase_t;
 
 static volatile bool     g_running = false;   // set by web START/STOP
+static volatile bool     g_tight = false;     // set by web TIGHT start/stop
 static motor_phase_t     g_phase = PHASE_IDLE;
+static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
+
+// Current applied to both motors while tight mode is active.
+#define TIGHT_CURRENT_A 0.5f
 
 // Position tolerance (deg) used to decide that a motor has "approached" its
 // target. A motor counts as arrived when |pos - target| <= this value OR the
@@ -243,6 +249,7 @@ static const char *phase_name(motor_phase_t p) {
     case PHASE_R_TO_ZERO: return "R->Zero";
     case PHASE_L_TO_POS:  return "L->Pos";
     case PHASE_L_TO_ZERO: return "L->Zero";
+    case PHASE_COOLDOWN:  return "Cooldown";
     default:              return "Idle";
   }
 }
@@ -268,6 +275,13 @@ static void motor_cmd_rpm(uint8_t id, int32_t rpm) {
   xSemaphoreGive(can_tx_mux);
 }
 
+// Send a current-loop command with CAN TX serialization (tight mode).
+static void motor_cmd_current(uint8_t id, float amps) {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_current(id, amps);
+  xSemaphoreGive(can_tx_mux);
+}
+
 // ============================================================================
 // Control task: runs at 100 Hz (CAN RX + TX rate).
 //   - drains all pending TWAI frames into the motor status structs
@@ -283,7 +297,12 @@ static void control_task(void *arg) {
       motor_poll(&rx);
     }
 
-    if (g_running) {
+    if (g_tight) {
+      // Tight mode: hold both motors at TIGHT_CURRENT_A continuously.
+      // Bypasses the movement state machine while active; it resumes on stop.
+      motor_cmd_current(MOTOR_LEFT_CAN_ID, TIGHT_CURRENT_A);
+      motor_cmd_current(MOTOR_RIGHT_CAN_ID, TIGHT_CURRENT_A);
+    } else if (g_running) {
       motor_params_t p;
       motor_params_get(&p);
 
@@ -293,29 +312,41 @@ static void control_task(void *arg) {
         g_phase_start_ms = millis();
       }
 
-      // Determine the active motor, its target and which parameter group applies.
-      uint8_t id = 0;
-      float   target = 0.0f;
-      bool    is_pos_phase = true;   // to-Pos phases use the "pos" param group
-      int32_t cmd_spd = 0, cmd_rpa = 0;
-      uint32_t timeout = 0;
-      bool    has_target = true;
+      if (g_phase == PHASE_COOLDOWN) {
+        // --- Cooldown phase: non-blocking idle gap between cycles. ---
+        // Commands keep flowing every cycle so nothing coasts during the gap.
+        // A blocking vTaskDelay here would send no CAN frames at all — in
+        // speed-only mode the active motor would then coast at its last RPM for
+        // the whole gap (drift/imbalance). In pos+spd mode no TX is needed:
+        // the controller holds its last position target.
+        if ((millis() - g_phase_start_ms) >= p.cooldown_ms) {
+          g_phase = g_next_phase;
+          g_phase_start_ms = millis();
+        } else if (p.speed_only) {
+          motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
+          motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
+        }
+      } else {
+        // Determine the active motor, its target and which parameter group applies.
+        uint8_t id = 0;
+        float   target = 0.0f;
+        bool    is_pos_phase = true;   // to-Pos phases use the "pos" param group
+        int32_t cmd_spd = 0, cmd_rpa = 0;
+        uint32_t timeout = 0;
 
-      switch (g_phase) {
-        case PHASE_R_TO_POS:
-          id = MOTOR_RIGHT_CAN_ID; target = -p.pos; is_pos_phase = true; break; // right uses negative pos
-        case PHASE_R_TO_ZERO:
-          id = MOTOR_RIGHT_CAN_ID; target = 0.0f;   is_pos_phase = false; break;
-        case PHASE_L_TO_POS:
-          id = MOTOR_LEFT_CAN_ID;  target = p.pos;  is_pos_phase = true; break; // left uses positive pos
-        case PHASE_L_TO_ZERO:
-          id = MOTOR_LEFT_CAN_ID;  target = 0.0f;   is_pos_phase = false; break;
-        default:
-          has_target = false;
-          break;
-      }
+        switch (g_phase) {
+          case PHASE_R_TO_POS:
+            id = MOTOR_RIGHT_CAN_ID; target = -p.pos; is_pos_phase = true; break; // right uses negative pos
+          case PHASE_R_TO_ZERO:
+            id = MOTOR_RIGHT_CAN_ID; target = 0.0f;   is_pos_phase = false; break;
+          case PHASE_L_TO_POS:
+            id = MOTOR_LEFT_CAN_ID;  target = p.pos;  is_pos_phase = true; break; // left uses positive pos
+          case PHASE_L_TO_ZERO:
+            id = MOTOR_LEFT_CAN_ID;  target = 0.0f;   is_pos_phase = false; break;
+          default:
+            break;
+        }
 
-      if (has_target) {
         const motor_status_t *st = (id == MOTOR_RIGHT_CAN_ID) ? &motor_right : &motor_left;
 
         // Per-phase speed / acceleration / time limit from the matching group.
@@ -335,10 +366,10 @@ static void control_task(void *arg) {
                                  : motor_approached(st, target, timeout);
         if (done) {
           switch (g_phase) {
-            case PHASE_R_TO_POS:  g_phase = PHASE_R_TO_ZERO; break;
-            case PHASE_R_TO_ZERO: g_phase = PHASE_L_TO_POS;  vTaskDelay(pdMS_TO_TICKS(p.cooldown_ms)); break; // cooldown before L->Pos
-            case PHASE_L_TO_POS:  g_phase = PHASE_L_TO_ZERO; break;
-            case PHASE_L_TO_ZERO: g_phase = PHASE_R_TO_POS;  vTaskDelay(pdMS_TO_TICKS(p.cooldown_ms)); break; // cooldown before R->Pos (next cycle)
+            case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
+            case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
+            case PHASE_L_TO_POS:  g_next_phase = PHASE_L_TO_ZERO; g_phase = PHASE_L_TO_ZERO; break;
+            case PHASE_L_TO_ZERO: g_next_phase = PHASE_R_TO_POS;  g_phase = (p.cooldown_ms > 0) ? PHASE_COOLDOWN : PHASE_R_TO_POS; break; // cooldown before R->Pos (next cycle)
             default: break;
           }
           g_phase_start_ms = millis();
@@ -384,9 +415,9 @@ void motor_print_csv() {
   portEXIT_CRITICAL(&motor_mux);
 
   char line[64];
-  snprintf(line, sizeof(line), "%lu,L,%.1f,%.1f,%.2f,%d,%d\n", (unsigned long)t, l.motor_pos, l.motor_spd, l.motor_cur, (int)l.temp, (int)l.error);
+  snprintf(line, sizeof(line), "%lu,L,%.1f,%.1f,%.2f,%d,%d\r\n", (unsigned long)t, l.motor_pos, l.motor_spd, l.motor_cur, (int)l.temp, (int)l.error);
   Serial.print(line);
-  snprintf(line, sizeof(line), "%lu,R,%.1f,%.1f,%.2f,%d,%d\n", (unsigned long)t, r.motor_pos, r.motor_spd, r.motor_cur, (int)r.temp, (int)r.error);
+  snprintf(line, sizeof(line), "%lu,R,%.1f,%.1f,%.2f,%d,%d\r\n", (unsigned long)t, r.motor_pos, r.motor_spd, r.motor_cur, (int)r.temp, (int)r.error);
   Serial.print(line);
 }
 

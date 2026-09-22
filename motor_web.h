@@ -35,6 +35,23 @@ static void handleStop() {
   server.send(200, "text/plain", "stopped");
 }
 
+// Tight mode: while active the control task streams TIGHT_CURRENT_A (0.5 A) to
+// both motors via comm_can_set_current(). Stop sends a one-shot 0 A so the
+// controllers don't keep holding current after tight mode ends.
+static void handleTightStart() {
+  g_tight = true;
+  server.send(200, "text/plain", "tight start");
+}
+
+static void handleTightStop() {
+  g_tight = false;
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_current(MOTOR_LEFT_CAN_ID, 0.0f);
+  comm_can_set_current(MOTOR_RIGHT_CAN_ID, 0.0f);
+  xSemaphoreGive(can_tx_mux);
+  server.send(200, "text/plain", "tight stop");
+}
+
 // One-shot origin commands: serialize with the control task's CAN TX.
 static void handleSetOriginLeft() {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
@@ -92,6 +109,7 @@ static void handleStatus() {
   s += g_running ? "YES" : "no";
   s += ", phase: "; s += motor_phase_name();
   s += ", mode: "; s += p.speed_only ? "RPM (speed-only)" : "POS_SPD (pos+spd)";
+  s += ", tight: "; s += g_tight ? "YES" : "no";
   s += "\n";
   // One field per line so the web page can parse and auto-populate the form.
   s += "pos="; s += p.pos;
@@ -127,6 +145,8 @@ static void webserver_init() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/start", HTTP_GET, handleStart);
   server.on("/stop", HTTP_GET, handleStop);
+  server.on("/tight_start", HTTP_GET, handleTightStart);
+  server.on("/tight_stop", HTTP_GET, handleTightStop);
   server.on("/set_origin_left", HTTP_GET, handleSetOriginLeft);
   server.on("/set_origin_right", HTTP_GET, handleSetOriginRight);
   server.on("/set_para", HTTP_GET, handleSetPara);

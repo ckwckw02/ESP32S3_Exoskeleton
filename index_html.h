@@ -48,6 +48,12 @@ static const char INDEX_HTML[] = R"rawliteral(
   </div>
 
   <div class="section">
+    <h2>Tight</h2>
+    <button class="start" onclick="cmd('/tight_start')">Start (0.5 A)</button>
+    <button class="stop" onclick="cmd('/tight_stop')">Stop (0 A)</button>
+  </div>
+
+  <div class="section">
     <h2>Motor Parameters</h2>
     <form onsubmit="return setPara(event)">
       <p style="margin:4px 0; font-weight:bold;">To Pos (R&rarr;Pos, L&rarr;Pos)</p>
@@ -99,12 +105,14 @@ static const char INDEX_HTML[] = R"rawliteral(
       fetch('/set_para?' + q).catch(function () {});
       return false;
     }
-    // Show/hide the fields that don't apply to the current control mode.
+    // Show/hide the fields (and their labels) that don't apply to this mode.
     function applyModeUI(rpmOn) {
-      var posOnly = ['pos', 'rpa_pos', 'rpa_zero']; // hidden in speed-only mode
+      var posOnly = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
       for (var i = 0; i < posOnly.length; i++) {
-        var el = document.getElementById(posOnly[i]);
+        var el = document.getElementById(posOnly[i][0]);
         if (el) el.style.display = rpmOn ? 'none' : '';
+        var lb = document.getElementById(posOnly[i][1]);
+        if (lb) lb.style.display = rpmOn ? 'none' : '';
       }
     }
     // Stop auto-filling the inputs once the user starts editing them.
