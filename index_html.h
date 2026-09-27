@@ -36,8 +36,13 @@ static const char INDEX_HTML[] = R"rawliteral(
   <div class="section">
     <h2>Control Mode</h2>
     <label style="font-weight:normal; display:inline;">
-      <input type="checkbox" id="speed_only" onchange="setMode(this.checked)">
-      Speed-only
+      <input type="radio" name="mode_sel" value="0" onchange="setMode(0)"> Pos+Spd (position loop)
+    </label><br>
+    <label style="font-weight:normal; display:inline;">
+      <input type="radio" name="mode_sel" value="1" onchange="setMode(1)"> Speed-only (RPM)
+    </label><br>
+    <label style="font-weight:normal; display:inline;">
+      <input type="radio" name="mode_sel" value="2" onchange="setMode(2)"> Equation (gait model)
     </label>
   </div>
 
@@ -53,7 +58,7 @@ static const char INDEX_HTML[] = R"rawliteral(
     <button class="stop" onclick="cmd('/tight_stop')">Stop (duty 0)</button>
   </div>
 
-  <div class="section">
+  <div class="section" id="para_section">
     <h2>Motor Parameters</h2>
     <form onsubmit="return setPara(event)">
       <p style="margin:4px 0; font-weight:bold;">To Pos (R&rarr;Pos, L&rarr;Pos)</p>
@@ -81,6 +86,29 @@ static const char INDEX_HTML[] = R"rawliteral(
     </form>
   </div>
 
+  <div class="section" id="eq_section">
+    <h2>Equation Mode</h2>
+    <p style="margin:4px 0; font-size:0.85em;">Lift/release rpm + times are computed from the gait geometry (eq8&ndash;eq14) and shown in the status box below.</p>
+    <form onsubmit="return setEq(event)">
+      <label>T &mdash; cycle period (s)</label>
+      <input type="number" step="any" name="eq_T" id="eq_T" value="1.78" min="0">
+      <label>SL &mdash; step length (cm)</label>
+      <input type="number" step="any" name="eq_SL" id="eq_SL" value="49.4" min="0">
+      <label>L (cm)</label>
+      <input type="number" step="any" name="eq_L" id="eq_L" value="100" min="0">
+      <label>Lp (cm)</label>
+      <input type="number" step="any" name="eq_Lp" id="eq_Lp" value="10" min="0">
+      <label>LD (cm)</label>
+      <input type="number" step="any" name="eq_LD" id="eq_LD" value="52" min="0">
+      <label>H (cm)</label>
+      <input type="number" step="any" name="eq_H" id="eq_H" value="12" min="0">
+      <label style="font-weight:normal; display:inline;">
+        <input type="checkbox" id="eq_pd"> pd: 1 = PD (alpha from gait), 0 = healthy (alpha=0.52 rad)
+      </label>
+      <button class="set" type="submit">Set</button>
+    </form>
+  </div>
+
   <div class="section">
     <h2>Wi-Fi AP clients (debug)</h2>
     <div class="status" id="wifi" style="margin-top:0;">loading...</div>
@@ -92,13 +120,16 @@ static const char INDEX_HTML[] = R"rawliteral(
     function cmd(path) {
       fetch(path).catch(function () {});
     }
-    function setMode(on) {
-      fetch('/set_mode?mode=' + (on ? 1 : 0)).catch(function () {});
+    // mode: 0 = pos+spd, 1 = speed-only (RPM), 2 = equation. Exactly one active.
+    function setMode(m) {
+      fetch('/set_mode?mode=' + m).catch(function () {});
     }
     // All parameter field ids, in send order. Fields hidden for the current
     // mode are skipped so their stored values persist on the device.
     var PARA_IDS = ['pos', 'spd_pos', 'rpa_pos', 'approach_pos',
                     'spd_zero', 'rpa_zero', 'approach_zero', 'cooldown'];
+    // Equation-mode field ids (sent by setEq, auto-populated from /status).
+    var EQ_IDS = ['eq_T', 'eq_SL', 'eq_L', 'eq_Lp', 'eq_LD', 'eq_H'];
     function setPara(e) {
       e.preventDefault();
       var q = '';
@@ -110,14 +141,35 @@ static const char INDEX_HTML[] = R"rawliteral(
       fetch('/set_para?' + q).catch(function () {});
       return false;
     }
-    // Show/hide the fields (and their labels) that don't apply to this mode.
-    function applyModeUI(rpmOn) {
-      var posOnly = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
-      for (var i = 0; i < posOnly.length; i++) {
-        var el = document.getElementById(posOnly[i][0]);
-        if (el) el.style.display = rpmOn ? 'none' : '';
-        var lb = document.getElementById(posOnly[i][1]);
-        if (lb) lb.style.display = rpmOn ? 'none' : '';
+    // Send the equation-mode inputs to the device.
+    function setEq(e) {
+      e.preventDefault();
+      var q = '';
+      for (var i = 0; i < EQ_IDS.length; i++) {
+        var el = document.getElementById(EQ_IDS[i]);
+        if (!el) continue;
+        q += (q ? '&' : '') + EQ_IDS[i] + '=' + encodeURIComponent(el.value);
+      }
+      var pdEl = document.getElementById('eq_pd');
+      q += '&eq_pd=' + (pdEl && pdEl.checked ? 1 : 0);
+      fetch('/set_para?' + q).catch(function () {});
+      return false;
+    }
+    // Show/hide the sections and fields that don't apply to this mode.
+    // modeId: 0 = pos+spd (all parameter fields), 1 = RPM (hide pos + RPA),
+    // 2 = equation (hide Motor Parameters, show Equation section).
+    function applyModeUI(modeId) {
+      var paraSec = document.getElementById('para_section');
+      if (paraSec) paraSec.style.display = (modeId === 2) ? 'none' : '';
+      var eqSec = document.getElementById('eq_section');
+      if (eqSec) eqSec.style.display = (modeId === 2) ? '' : 'none';
+      // In RPM mode the pos + RPA fields don't apply; restore them otherwise.
+      var rpmHide = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
+      for (var i = 0; i < rpmHide.length; i++) {
+        var el = document.getElementById(rpmHide[i][0]);
+        if (el) el.style.display = (modeId === 1) ? 'none' : '';
+        var lb = document.getElementById(rpmHide[i][1]);
+        if (lb) lb.style.display = (modeId === 1) ? 'none' : '';
       }
     }
     // Stop auto-filling the inputs once the user starts editing them.
@@ -126,24 +178,46 @@ static const char INDEX_HTML[] = R"rawliteral(
       var el = document.getElementById(PARA_IDS[i]);
       if (el) el.addEventListener('input', function () { paramsTouched = true; });
     }
+    var eqTouched = false;
+    for (var k = 0; k < EQ_IDS.length; k++) {
+      var e2 = document.getElementById(EQ_IDS[k]);
+      if (e2) e2.addEventListener('input', function () { eqTouched = true; });
+    }
+    // The pd checkbox has no 'input' event to watch — a toggle IS the edit,
+    // so mark it touched immediately or auto-populate would re-check it.
+    var pdCb0 = document.getElementById('eq_pd');
+    if (pdCb0) pdCb0.addEventListener('change', function () { eqTouched = true; });
 
     setInterval(function () {
       fetch('/status')
         .then(function (r) { return r.text(); })
         .then(function (t) {
           document.getElementById('status').textContent = t;
-          // Keep the mode checkbox + visible fields in sync with the device.
-          var cb = document.getElementById('speed_only');
-          if (cb) {
-            var on = t.indexOf('mode: RPM') >= 0;
-            if (cb.checked !== on) cb.checked = on;
-            applyModeUI(on);
+          // Keep the mode selector + visible sections in sync with the device.
+          var mId = t.match(/^mode_id=(\d+)$/m);
+          if (mId) {
+            var id = parseInt(mId[1], 10);
+            var sel = document.querySelector('input[name="mode_sel"][value="' + id + '"]');
+            if (sel && !sel.checked) sel.checked = true;
+            applyModeUI(id);
           }
           // Auto-populate the parameter inputs from the device until first edit.
           if (!paramsTouched) {
             for (var j = 0; j < PARA_IDS.length; j++) {
               var m = t.match(new RegExp('^' + PARA_IDS[j] + '=(-?[0-9.]+)', 'm'));
               if (m) document.getElementById(PARA_IDS[j]).value = parseFloat(m[1]);
+            }
+          }
+          // Auto-populate the equation inputs from the device until first edit.
+          if (!eqTouched) {
+            for (var k2 = 0; k2 < EQ_IDS.length; k2++) {
+              var me = t.match(new RegExp('^' + EQ_IDS[k2] + '=(-?[0-9.]+)', 'm'));
+              if (me) document.getElementById(EQ_IDS[k2]).value = parseFloat(me[1]);
+            }
+            var mpd = t.match(/^eq_pd=(\d+)$/m);
+            if (mpd) {
+              var pdEl2 = document.getElementById('eq_pd');
+              if (pdEl2) pdEl2.checked = (parseInt(mpd[1], 10) !== 0);
             }
           }
         })

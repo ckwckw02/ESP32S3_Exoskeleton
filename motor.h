@@ -2,6 +2,7 @@
 #define MOTOR_H
 
 #include <math.h>
+#include "equation.h"
 #include "driver/twai.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -152,6 +153,15 @@ void motor_poll(const twai_message_t *msg) {
 // task). All access goes through the mutex below so values are always
 // consistent.
 // ============================================================================
+
+// Control mode — exactly one is active at a time (set from the web UI).
+typedef enum {
+  MODE_POS_SPD = 0,   // pos+spd loop: comm_can_set_pos_spd(target, Spd, RPA)
+  MODE_RPM     = 1,   // speed-only loop: comm_can_set_rpm, time-based phases
+  MODE_EQUATION= 2    // equation mode: computed lift/release rpm + times;
+                      // release must pass through zero before advancing
+} motor_mode_t;
+
 typedef struct {
   // --- "To Pos" group (R->Pos and L->Pos phases) ---
   float    pos;            // target position magnitude (deg), pos+spd mode only
@@ -164,8 +174,23 @@ typedef struct {
   uint32_t approach_zero_ms;  // max time in a "to Zero" phase
   // --- shared ---
   uint32_t cooldown_ms;       // idle wait before each "to Pos" phase
-  bool     speed_only;    // false: pos+spd loop (comm_can_set_pos_spd)
-                          // true:  speed-only loop (comm_can_set_rpm), time-based phases
+  // --- control mode (exactly one active at a time) ---
+  motor_mode_t mode;          // MODE_POS_SPD / MODE_RPM / MODE_EQUATION
+  // --- equation mode inputs (gait geometry, eq8-eq14) ---
+  float    T;                 // gait cycle period (s)
+  float    SL;                // step length (cm)
+  float    L;                 // link length (cm)
+  float    Lp;                // link offset (cm)
+  float    LD;                // link distance (cm)
+  float    H;                 // height (cm)
+  int      pd;                // 1 = PD (alpha from gait), 0 = healthy (alpha=0.52 rad)
+  // --- equation mode computed outputs (written by motor_equation_compute) ---
+  int32_t  eq_lift_rpm;       // ERPM for lift (to-Pos phases)
+  int32_t  eq_release_rpm;    // ERPM for release (to-Zero phases)
+  uint32_t eq_lift_ms;        // lift time = 0.4*T*1000 ms
+  uint32_t eq_release_ms;     // release time = 0.6*T*1000 ms
+  float    eq_dL;             // computed cable travel (cm), for debug display
+  bool     eq_valid;          // false when inputs are invalid (rpm forced to 0)
 } motor_params_t;
 
 static motor_params_t g_params = {
@@ -177,7 +202,14 @@ static motor_params_t g_params = {
   .rpa_zero = 60000,
   .approach_zero_ms = 1000,
   .cooldown_ms = 0,
-  .speed_only = false,
+  .mode = MODE_POS_SPD,
+  .T = 1.78f,
+  .SL = 49.4f,
+  .L = 100.0f,
+  .Lp = 10.0f,
+  .LD = 52.0f,
+  .H = 12.0f,
+  .pd = 1,
 };
 
 // Mutex protecting g_params (web task writes / control task reads)
@@ -202,6 +234,25 @@ static inline void motor_params_set(const motor_params_t *in) {
 }
 
 // ============================================================================
+// Equation mode: gait-geometry model (eq8-eq14) that converts one gait cycle
+// into motor commands. The math itself lives in equation.h (motor_equation,
+// pure and PC-testable); this adapter copies the result into the shared params.
+// Invalid inputs leave eq_valid=false and force both rpm outputs to 0 so
+// nothing bad hits the CAN bus; ERPM is clamped to the documented Spd range.
+// ============================================================================
+static void motor_equation_compute(motor_params_t *p) {
+  equation_result_t r;
+  motor_equation(p->T, p->SL, p->L, p->Lp, p->LD, p->H, p->pd, &r);
+
+  p->eq_dL          = r.dL;
+  p->eq_lift_rpm    = constrain(r.lift_rpm, -40000, 40000);
+  p->eq_release_rpm = constrain(r.release_rpm, -40000, 40000);
+  p->eq_lift_ms     = r.lift_ms;
+  p->eq_release_ms  = r.release_ms;
+  p->eq_valid       = r.valid;
+}
+
+// ============================================================================
 // Movement state machine (owned exclusively by the control task).
 //
 // Sequence per cycle (repeats until STOP):
@@ -210,7 +261,7 @@ static inline void motor_params_set(const motor_params_t *in) {
 //   L -> Pos  (cooldown first, wait until approached)
 //   L -> 0    (wait until approached)
 //
-// Two control modes share this sequence:
+// Three control modes share this sequence:
 //   pos+spd loop : comm_can_set_pos_spd(target, Spd, RPA) to the active motor;
 //                  a phase ends when the position is reached or its time limit
 //                  elapses. Each group (to-Pos / to-Zero) has its own Spd/RPA/time.
@@ -219,6 +270,11 @@ static inline void motor_params_set(const motor_params_t *in) {
 //                  loop holds its last target, so the idle motor must be held).
 //                  Phases are purely time-based: each runs for exactly its group's
 //                  time limit with no position check. Tune |Spd| x time ~= distance.
+//   equation     : like speed-only, but lift (to-Pos) and release (to-Zero)
+//                  rpm/times come from the gait-geometry model
+//                  (motor_equation_compute). Release phases additionally require
+//                  the motor to pass through zero before advancing, even past
+//                  their nominal time.
 // ============================================================================
 typedef enum {
   PHASE_IDLE = 0,
@@ -322,7 +378,7 @@ static void control_task(void *arg) {
         if ((millis() - g_phase_start_ms) >= p.cooldown_ms) {
           g_phase = g_next_phase;
           g_phase_start_ms = millis();
-        } else if (p.speed_only) {
+        } else if (p.mode != MODE_POS_SPD) {
           motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
           motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
         }
@@ -350,20 +406,50 @@ static void control_task(void *arg) {
         const motor_status_t *st = (id == MOTOR_RIGHT_CAN_ID) ? &motor_right : &motor_left;
 
         // Per-phase speed / acceleration / time limit from the matching group.
-        cmd_spd  = is_pos_phase ? p.spd_pos  : p.spd_zero;
-        cmd_rpa  = is_pos_phase ? p.rpa_pos  : p.rpa_zero;
-        timeout  = is_pos_phase ? p.approach_pos_ms : p.approach_zero_ms;
+        // Equation mode overrides Spd/time with its computed lift/release values
+        // (lift = to-Pos phases, release = to-Zero phases).
+        if (p.mode == MODE_EQUATION) {
+          cmd_spd  = is_pos_phase ? p.eq_lift_rpm    : p.eq_release_rpm;
+          timeout  = is_pos_phase ? p.eq_lift_ms     : p.eq_release_ms;
+        } else {
+          cmd_spd  = is_pos_phase ? p.spd_pos  : p.spd_zero;
+          cmd_rpa  = is_pos_phase ? p.rpa_pos  : p.rpa_zero;
+          timeout  = is_pos_phase ? p.approach_pos_ms : p.approach_zero_ms;
+        }
 
-        // Speed-only mode: signed |Spd| for the current phase, computed before any
-        // transition so a transition cycle still sends the old phase's command.
+        // Speed-based modes (RPM / equation): signed |Spd| for the current phase,
+        // computed before any transition so a transition cycle still sends the old
+        // phase's command.
         int32_t spd_abs    = cmd_spd < 0 ? -cmd_spd : cmd_spd;
         int32_t signed_rpm = (g_phase == PHASE_R_TO_POS || g_phase == PHASE_L_TO_ZERO) ? -spd_abs : +spd_abs;
 
         // Phase complete? Advance to the next phase.
         //   pos+spd mode: position within tolerance OR time limit elapsed.
         //   speed-only  : purely time-based — the phase runs for exactly its time.
-        bool done = p.speed_only ? ((millis() - g_phase_start_ms) >= timeout)
-                                 : motor_approached(st, target, timeout);
+        //   equation    : lift (to-Pos) is purely time-based; release (to-Zero)
+        //                 must also pass through zero even if the nominal time has
+        //                 already elapsed: right motor waits until pos >= 0, left
+        //                 until pos <= 0. No hard timeout — STOP aborts instead.
+        bool done;
+        if (p.mode == MODE_EQUATION) {
+          uint32_t elapsed = millis() - g_phase_start_ms;
+          if (is_pos_phase) {
+            // Lift: purely time-based, like speed-only mode.
+            done = elapsed >= timeout;
+          } else {
+            // Release: nominal time floor AND the motor must have passed through
+            // zero — right comes from negative (pos >= 0), left from positive
+            // (pos <= 0). No upper bound: a slow motor keeps releasing until it
+            // crosses; STOP is the abort mechanism.
+            bool crossed = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= 0.0f)
+                                                      : (st->motor_pos <= 0.0f);
+            done = (elapsed >= timeout) && crossed;
+          }
+        } else if (p.mode == MODE_RPM) {
+          done = (millis() - g_phase_start_ms) >= timeout;
+        } else {
+          done = motor_approached(st, target, timeout);
+        }
         if (done) {
           switch (g_phase) {
             case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
@@ -376,7 +462,7 @@ static void control_task(void *arg) {
         }
 
         // --- CAN TX: command the active motor at 100 Hz while its phase runs ---
-        if (!p.speed_only) {
+        if (p.mode == MODE_POS_SPD) {
           motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
         } else {
           // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
@@ -388,11 +474,11 @@ static void control_task(void *arg) {
         }
       }
     } else if (g_phase != PHASE_IDLE) {
-      // Stop transition: in speed-only mode the motors would otherwise keep
+      // Stop transition: in speed-based modes the motors would otherwise keep
       // spinning at their last commanded rpm, so hold both at zero once.
       motor_params_t p;
       motor_params_get(&p);
-      if (p.speed_only) {
+      if (p.mode != MODE_POS_SPD) {
         motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
         motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
       }
@@ -430,6 +516,9 @@ static void status_timer_cb(TimerHandle_t t) {
 void motor_control_start() {
   if (params_mux == NULL) params_mux = xSemaphoreCreateMutex();
   if (can_tx_mux == NULL) can_tx_mux = xSemaphoreCreateMutex();
+
+  // Compute the equation-mode outputs once so /status is valid from boot.
+  motor_equation_compute(&g_params);
 
   // Dedicated control task at 100 Hz, higher priority than the Arduino loop
   // so CAN RX/TX and phase timing stay real-time even while serving HTTP.

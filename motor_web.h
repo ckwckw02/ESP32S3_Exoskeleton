@@ -84,21 +84,38 @@ static void handleSetPara() {
   if (server.hasArg("approach_zero"))  p.approach_zero_ms = constrain(server.arg("approach_zero").toInt(), 50, 60000);
   // shared
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
+  // equation mode inputs
+  if (server.hasArg("eq_T"))           p.T    = server.arg("eq_T").toFloat();
+  if (server.hasArg("eq_SL"))          p.SL   = server.arg("eq_SL").toFloat();
+  if (server.hasArg("eq_L"))           p.L    = server.arg("eq_L").toFloat();
+  if (server.hasArg("eq_Lp"))          p.Lp   = server.arg("eq_Lp").toFloat();
+  if (server.hasArg("eq_LD"))          p.LD   = server.arg("eq_LD").toFloat();
+  if (server.hasArg("eq_H"))           p.H    = server.arg("eq_H").toFloat();
+  if (server.hasArg("eq_pd"))          p.pd   = (server.arg("eq_pd").toInt() != 0) ? 1 : 0;
+
+  // Recompute the equation outputs so edits apply live while in equation mode.
+  motor_equation_compute(&p);
 
   motor_params_set(&p);
   server.send(200, "text/plain", "params set");
 }
 
-// Toggle the control mode: ?mode=1 -> speed-only loop (comm_can_set_rpm),
-// ?mode=0 -> pos+spd loop (comm_can_set_pos_spd). Takes effect immediately.
+// Set the control mode: ?mode=0 -> pos+spd loop (comm_can_set_pos_spd),
+// ?mode=1 -> speed-only loop (comm_can_set_rpm), ?mode=2 -> equation mode.
+// Takes effect immediately; exactly one mode is active at a time.
 static void handleSetMode() {
   motor_params_t p;
   motor_params_get(&p);
 
-  if (server.hasArg("mode")) p.speed_only = (server.arg("mode").toInt() != 0);
+  if (server.hasArg("mode")) p.mode = (motor_mode_t)constrain(server.arg("mode").toInt(), 0, 2);
+
+  // Refresh the equation outputs when switching into equation mode.
+  if (p.mode == MODE_EQUATION) motor_equation_compute(&p);
 
   motor_params_set(&p);
-  server.send(200, "text/plain", p.speed_only ? "mode: rpm" : "mode: pos_spd");
+  const char *name = (p.mode == MODE_POS_SPD) ? "mode: pos_spd" :
+                     (p.mode == MODE_RPM)     ? "mode: rpm"     : "mode: equation";
+  server.send(200, "text/plain", name);
 }
 
 static void handleStatus() {
@@ -109,8 +126,14 @@ static void handleStatus() {
   s += "running: ";
   s += g_running ? "YES" : "no";
   s += ", phase: "; s += motor_phase_name();
-  s += ", mode: "; s += p.speed_only ? "RPM (speed-only)" : "POS_SPD (pos+spd)";
+  s += ", mode: ";
+  if (p.mode == MODE_POS_SPD)      s += "POS_SPD (pos+spd)";
+  else if (p.mode == MODE_RPM)     s += "RPM (speed-only)";
+  else                             s += "EQUATION (equation)";
   s += ", tight: "; s += g_tight ? "YES" : "no";
+  s += "\n";
+  // Machine-readable mode id so the page can sync its selector.
+  s += "mode_id="; s += (int)p.mode;
   s += "\n";
   // One field per line so the web page can parse and auto-populate the form.
   s += "pos="; s += p.pos;
@@ -122,6 +145,35 @@ static void handleStatus() {
   s += "\napproach_zero="; s += p.approach_zero_ms;
   s += "\ncooldown="; s += p.cooldown_ms;
   s += " ms\n";
+  // Equation mode inputs (always shown so the form can auto-populate).
+  char eqline[48];
+  snprintf(eqline, sizeof(eqline), "eq_T=%.3f",   p.T);    s += "\n"; s += eqline;
+  snprintf(eqline, sizeof(eqline), "eq_SL=%.2f",  p.SL);   s += "\n"; s += eqline;
+  snprintf(eqline, sizeof(eqline), "eq_L=%.2f",   p.L);    s += "\n"; s += eqline;
+  snprintf(eqline, sizeof(eqline), "eq_Lp=%.2f",  p.Lp);   s += "\n"; s += eqline;
+  snprintf(eqline, sizeof(eqline), "eq_LD=%.2f",  p.LD);   s += "\n"; s += eqline;
+  snprintf(eqline, sizeof(eqline), "eq_H=%.2f",   p.H);    s += "\n"; s += eqline;
+  s += "\neq_pd="; s += p.pd;
+  s += "\n";
+  // Equation mode debug: computed outputs (shown while in equation mode).
+  if (p.mode == MODE_EQUATION) {
+    s += "\n--- equation ---\n";
+    snprintf(eqline, sizeof(eqline), "dL=%.3f cm", p.eq_dL);
+    s += eqline;
+    s += "\nlift: ";
+    s += p.eq_lift_rpm;
+    s += " ERPM ";
+    s += p.eq_lift_ms;
+    s += " ms | release: ";
+    s += p.eq_release_rpm;
+    s += " ERPM ";
+    s += p.eq_release_ms;
+    s += " ms";
+    if (!p.eq_valid) {
+      s += "\nEQ INVALID: check T>=0.1s, 0<SL<=2L and geometry (rpm held at 0)";
+    }
+    s += "\n";
+  }
   s += "L pos="; s += motor_left.motor_pos;
   s += " spd="; s += motor_left.motor_spd;
   s += " cur="; s += motor_left.motor_cur;
