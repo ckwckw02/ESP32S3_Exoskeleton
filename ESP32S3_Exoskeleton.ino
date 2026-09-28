@@ -34,7 +34,7 @@ void comm_can_transmit_eid(uint32_t id, const uint8_t *data, uint8_t len) {
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
-  Serial.print("\r\Serial init ok\r\n");
+  Serial.print("\r\n\Serial init ok\r\n");
 
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
     Serial.print("CAN init ok\r\n");
