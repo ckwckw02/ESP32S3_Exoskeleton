@@ -25,7 +25,7 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control</h1>
+  <h1>Motor Control 2026-09-28</h1>
 
   <div class="section">
     <h2>Run</h2>
@@ -36,37 +36,37 @@ static const char INDEX_HTML[] = R"rawliteral(
   <div class="section">
     <h2>Control Mode</h2>
     <label style="font-weight:normal; display:inline;">
-      <input type="radio" name="mode_sel" value="0" onchange="setMode(0)"> Pos+Spd (position loop)
+      <input type="radio" name="mode_sel" value="0" onchange="setMode(0)"> Position Velocity Loop
     </label><br>
     <label style="font-weight:normal; display:inline;">
-      <input type="radio" name="mode_sel" value="1" onchange="setMode(1)"> Speed-only (RPM)
+      <input type="radio" name="mode_sel" value="1" onchange="setMode(1)"> Velocity Loo
     </label><br>
     <label style="font-weight:normal; display:inline;">
-      <input type="radio" name="mode_sel" value="2" onchange="setMode(2)"> Equation (gait model)
+      <input type="radio" name="mode_sel" value="2" onchange="setMode(2)"> Equation
     </label>
   </div>
 
   <div class="section">
     <h2>Origin</h2>
-    <button class="origin" onclick="cmd('/set_origin_left')">Set LEFT motor origin</button>
-    <button class="origin" onclick="cmd('/set_origin_right')">Set RIGHT motor origin</button>
+    <button class="origin" onclick="cmd('/set_origin_left')">Set LEFT</button>
+    <button class="origin" onclick="cmd('/set_origin_right')">Set RIGHT</button>
   </div>
 
   <div class="section">
-    <h2>Tight</h2>
-    <button class="start" onclick="cmd('/tight_start')">Start (duty 0.03)</button>
-    <button class="stop" onclick="cmd('/tight_stop')">Stop (duty 0)</button>
+    <h2>Tight (duty 0.3)</h2>
+    <button class="start" onclick="cmd('/tight_start')">Start</button>
+    <button class="stop" onclick="cmd('/tight_stop')">Stop</button>
   </div>
 
   <div class="section" id="para_section">
     <h2>Motor Parameters</h2>
     <form onsubmit="return setPara(event)">
       <p style="margin:4px 0; font-weight:bold;">To Pos (R&rarr;Pos, L&rarr;Pos)</p>
-      <label id="lbl_pos">Pos (deg) &mdash; pos+spd mode only</label>
+      <label id="lbl_pos">Pos (deg) &mdash; Position Velocity Loop only</label>
       <input type="number" step="any" name="pos" id="pos" value="360">
       <label>Spd (-40000..40000)</label>
       <input type="number" name="spd_pos" id="spd_pos" value="40000" min="-40000" max="40000">
-      <label id="lbl_rpa_pos">RPA (0..60000) &mdash; pos+spd mode only</label>
+      <label id="lbl_rpa_pos">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_pos" id="rpa_pos" value="60000" min="0" max="60000">
       <label>Approach Pos time (ms)</label>
       <input type="number" name="approach_pos" id="approach_pos" value="1000" min="50">
@@ -74,7 +74,7 @@ static const char INDEX_HTML[] = R"rawliteral(
       <p style="margin:12px 0 4px; font-weight:bold;">To Zero (R&rarr;0, L&rarr;0)</p>
       <label>Spd (-40000..40000)</label>
       <input type="number" name="spd_zero" id="spd_zero" value="40000" min="-40000" max="40000">
-      <label id="lbl_rpa_zero">RPA (0..60000) &mdash; pos+spd mode only</label>
+      <label id="lbl_rpa_zero">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_zero" id="rpa_zero" value="60000" min="0" max="60000">
       <label>Approach Zero time (ms)</label>
       <input type="number" name="approach_zero" id="approach_zero" value="1000" min="50">
@@ -88,11 +88,10 @@ static const char INDEX_HTML[] = R"rawliteral(
 
   <div class="section" id="eq_section">
     <h2>Equation Mode</h2>
-    <p style="margin:4px 0; font-size:0.85em;">Lift/release rpm + times are computed from the gait geometry (eq8&ndash;eq14) and shown in the status box below.</p>
     <form onsubmit="return setEq(event)">
-      <label>T &mdash; cycle period (s)</label>
+      <label>T (s)</label>
       <input type="number" step="any" name="eq_T" id="eq_T" value="1.78" min="0">
-      <label>SL &mdash; step length (cm)</label>
+      <label>SL (cm)</label>
       <input type="number" step="any" name="eq_SL" id="eq_SL" value="49.4" min="0">
       <label>L (cm)</label>
       <input type="number" step="any" name="eq_L" id="eq_L" value="100" min="0">
@@ -103,7 +102,7 @@ static const char INDEX_HTML[] = R"rawliteral(
       <label>H (cm)</label>
       <input type="number" step="any" name="eq_H" id="eq_H" value="12" min="0">
       <label style="font-weight:normal; display:inline;">
-        <input type="checkbox" id="eq_pd"> pd: 1 = PD (alpha from gait), 0 = healthy (alpha=0.52 rad)
+        <input type="checkbox" id="eq_pd"> PD
       </label>
       <button class="set" type="submit">Set</button>
     </form>

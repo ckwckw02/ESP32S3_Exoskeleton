@@ -42,8 +42,17 @@ void setup() {
   } else
     Serial.print("CAN init fault\r\n");
 
-  // Activate the motor
-  comm_can_transmit_eid(0x00, (uint8_t[]){0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA}, 8);
+  // comm_can_set_origin(104, 0)
+  Serial.println(([&] {
+    twai_message_t msg = { .extd = 1, .identifier = 0x0568, .data_length_code = 1, .data = { 0x00 } };
+    return twai_transmit(&msg, pdMS_TO_TICKS(10));
+  })());
+
+  // comm_can_set_origin(105, 0)
+  Serial.println(([&] {
+    twai_message_t msg = { .extd = 1, .identifier = 0x0569, .data_length_code = 1, .data = { 0x00 } };
+    return twai_transmit(&msg, pdMS_TO_TICKS(10));
+  })());
 
   // Start the RTOS control system: 100 Hz CAN RX/TX control task + movement
   // state machine, plus the 10 ms CSV status print timer.
