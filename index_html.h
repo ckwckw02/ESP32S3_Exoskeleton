@@ -25,7 +25,7 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-09-28</h1>
+  <h1>Motor Control 2026-10-02</h1>
 
   <div class="section">
     <h2>Run</h2>
@@ -39,7 +39,7 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="radio" name="mode_sel" value="0" onchange="setMode(0)"> Position Velocity Loop
     </label><br>
     <label style="font-weight:normal; display:inline;">
-      <input type="radio" name="mode_sel" value="1" onchange="setMode(1)"> Velocity Loo
+      <input type="radio" name="mode_sel" value="1" onchange="setMode(1)"> Velocity Loop
     </label><br>
     <label style="font-weight:normal; display:inline;">
       <input type="radio" name="mode_sel" value="2" onchange="setMode(2)"> Equation

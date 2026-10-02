@@ -297,7 +297,7 @@ static uint32_t          g_phase_start_ms = 0; // when the current phase began
 // Position tolerance (deg) used to decide that a motor has "approached" its
 // target. A motor counts as arrived when |pos - target| <= this value OR the
 // phase time limit elapses (safety timeout so we never hang).
-#define APPROACH_TOL_DEG 10.0f
+#define APPROACH_TOL_DEG 5.0f
 
 static const char *phase_name(motor_phase_t p) {
   switch (p) {
