@@ -331,6 +331,14 @@ static void motor_cmd_rpm(uint8_t id, int32_t rpm) {
   xSemaphoreGive(can_tx_mux);
 }
 
+// Send a current-loop command with CAN TX serialization. A 0 A command cuts
+// torque immediately — used as the interrupt-style stop when STOP is pressed.
+static void motor_cmd_current(uint8_t id, float current) {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_current(id, current);
+  xSemaphoreGive(can_tx_mux);
+}
+
 // Send a duty-loop command with CAN TX serialization (tight mode).
 static void motor_cmd_duty(uint8_t id, float duty) {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
@@ -344,6 +352,8 @@ static void motor_cmd_duty(uint8_t id, float duty) {
 //   - advances the movement state machine
 //   - re-sends the active motor's command every cycle (100 Hz):
 //     pos+spd mode -> comm_can_set_pos_spd; speed-only -> comm_can_set_rpm
+//   - on STOP, cuts torque immediately with a 0 A current-loop command to
+//     both motors (interrupt-style stop, all modes)
 // ============================================================================
 static void control_task(void *arg) {
   twai_message_t rx;
@@ -474,14 +484,13 @@ static void control_task(void *arg) {
         }
       }
     } else if (g_phase != PHASE_IDLE) {
-      // Stop transition: in speed-based modes the motors would otherwise keep
-      // spinning at their last commanded rpm, so hold both at zero once.
-      motor_params_t p;
-      motor_params_get(&p);
-      if (p.mode != MODE_POS_SPD) {
-        motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
-        motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
-      }
+      // Stop transition: interrupt-style stop. Switch both motors into
+      // current-loop mode with 0 A so torque is cut immediately, instead of
+      // letting the controllers keep driving toward their last commanded
+      // position target (pos+spd mode would otherwise coast for hundreds of ms)
+      // or decelerate through the velocity loop at their last rpm (speed modes).
+      motor_cmd_current(MOTOR_LEFT_CAN_ID, 0.0f);
+      motor_cmd_current(MOTOR_RIGHT_CAN_ID, 0.0f);
       g_phase = PHASE_IDLE;
     }
 
