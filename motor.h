@@ -268,8 +268,9 @@ static void motor_equation_compute(motor_params_t *p) {
 //   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
 //                  comm_can_set_rpm(0) to the other one every cycle (a velocity
 //                  loop holds its last target, so the idle motor must be held).
-//                  Phases are purely time-based: each runs for exactly its group's
-//                  time limit with no position check. Tune |Spd| x time ~= distance.
+//                  Lift phases are purely time-based; release phases require the
+//                  motor to pass through zero before advancing (same rule as
+//                  equation mode). Tune |Spd| x time ~= distance.
 //   equation     : like speed-only, but lift (to-Pos) and release (to-Zero)
 //                  rpm/times come from the gait-geometry model
 //                  (motor_equation_compute). Release phases additionally require
@@ -287,6 +288,15 @@ typedef enum {
 
 static volatile bool     g_running = false;   // set by web START/STOP
 static volatile bool     g_tight = false;     // set by web TIGHT start/stop
+
+// One-shot trigger: a single pull->release cycle on ONE side only (web button).
+// The request is consumed by the control task when fully idle; the active flag
+// is task-owned and cleared when that side's to-Zero phase completes.
+#define ONESHOT_RIGHT 1
+#define ONESHOT_LEFT  2
+static volatile uint8_t  g_oneshot_req = 0;    // 0 = none, set by web
+static uint8_t           g_oneshot_active = 0; // one-shot cycle in progress
+
 static motor_phase_t     g_phase = PHASE_IDLE;
 static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
@@ -300,6 +310,16 @@ static uint32_t          g_phase_start_ms = 0; // when the current phase began
 #define APPROACH_TOL_DEG 5.0f
 
 static const char *phase_name(motor_phase_t p) {
+  // While a one-shot cycle runs, mark the phase so the status line shows it.
+  if (g_oneshot_active) {
+    switch (p) {
+      case PHASE_R_TO_POS:  return "1shot R->Pos";
+      case PHASE_R_TO_ZERO: return "1shot R->Zero";
+      case PHASE_L_TO_POS:  return "1shot L->Pos";
+      case PHASE_L_TO_ZERO: return "1shot L->Zero";
+      default:              return "1shot";
+    }
+  }
   switch (p) {
     case PHASE_R_TO_POS:  return "R->Pos";
     case PHASE_R_TO_ZERO: return "R->Zero";
@@ -363,12 +383,24 @@ static void control_task(void *arg) {
       motor_poll(&rx);
     }
 
+    // --- One-shot trigger: consume a pending request only when fully idle. ---
+    // Starts a single pull->release cycle on the requested side: to-Pos (reel
+    // in / 收繩) then to-Zero (release / 放繩), then back to Idle. The other
+    // side is never commanded.
+    if (g_oneshot_req != 0 && !g_running && !g_tight &&
+        g_oneshot_active == 0 && g_phase == PHASE_IDLE) {
+      g_oneshot_active = g_oneshot_req;
+      g_oneshot_req = 0;
+      g_phase = (g_oneshot_active == ONESHOT_LEFT) ? PHASE_L_TO_POS : PHASE_R_TO_POS;
+      g_phase_start_ms = millis();
+    }
+
     if (g_tight) {
       // Tight mode: hold both motors at TIGHT_DUTY continuously.
       // Bypasses the movement state machine while active; it resumes on stop.
       motor_cmd_duty(MOTOR_LEFT_CAN_ID, TIGHT_DUTY);
-      motor_cmd_duty(MOTOR_RIGHT_CAN_ID, TIGHT_DUTY);
-    } else if (g_running) {
+      motor_cmd_duty(MOTOR_RIGHT_CAN_ID, -TIGHT_DUTY);
+    } else if (g_running || g_oneshot_active) {
       motor_params_t p;
       motor_params_get(&p);
 
@@ -435,16 +467,17 @@ static void control_task(void *arg) {
 
         // Phase complete? Advance to the next phase.
         //   pos+spd mode: position within tolerance OR time limit elapsed.
-        //   speed-only  : purely time-based — the phase runs for exactly its time.
-        //   equation    : lift (to-Pos) is purely time-based; release (to-Zero)
-        //                 must also pass through zero even if the nominal time has
-        //                 already elapsed: right motor waits until pos >= 0, left
-        //                 until pos <= 0. No hard timeout — STOP aborts instead.
+        //   speed-only / equation (velocity-loop modes, shared rule):
+        //     lift (to-Pos)   — purely time-based, runs for exactly its time.
+        //     release (to-Zero) — nominal time floor AND the motor must have
+        //       passed through zero even if the nominal time already elapsed:
+        //       right motor waits until pos >= 0, left until pos <= 0. No hard
+        //       timeout — STOP aborts instead.
         bool done;
-        if (p.mode == MODE_EQUATION) {
+        if (p.mode == MODE_RPM || p.mode == MODE_EQUATION) {
           uint32_t elapsed = millis() - g_phase_start_ms;
           if (is_pos_phase) {
-            // Lift: purely time-based, like speed-only mode.
+            // Lift: purely time-based.
             done = elapsed >= timeout;
           } else {
             // Release: nominal time floor AND the motor must have passed through
@@ -455,13 +488,32 @@ static void control_task(void *arg) {
                                                       : (st->motor_pos <= 0.0f);
             done = (elapsed >= timeout) && crossed;
           }
-        } else if (p.mode == MODE_RPM) {
-          done = (millis() - g_phase_start_ms) >= timeout;
         } else {
           done = motor_approached(st, target, timeout);
         }
         if (done) {
-          switch (g_phase) {
+          if (g_oneshot_active) {
+            // One-shot: only this side's to-Pos -> to-Zero runs; after the
+            // to-Zero phase completes, go straight back to Idle (no cooldown,
+            // no opposite side).
+            if (g_phase == PHASE_R_TO_POS) {
+              g_phase = PHASE_R_TO_ZERO;
+            } else if (g_phase == PHASE_L_TO_POS) {
+              g_phase = PHASE_L_TO_ZERO;
+            } else {
+              // One-shot complete: hold the motor at zero so a velocity loop
+              // does not keep driving at its last rpm once commands stop.
+              if (p.mode == MODE_POS_SPD) {
+                motor_cmd_pos_spd(id, 0.0f, cmd_spd, cmd_rpa);
+              } else {
+                uint8_t other = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
+                motor_cmd_rpm(id, 0);
+                motor_cmd_rpm(other, 0);
+              }
+              g_phase = PHASE_IDLE;
+              g_oneshot_active = 0;
+            }
+          } else switch (g_phase) {
             case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
             case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
             case PHASE_L_TO_POS:  g_next_phase = PHASE_L_TO_ZERO; g_phase = PHASE_L_TO_ZERO; break;
@@ -492,6 +544,8 @@ static void control_task(void *arg) {
       motor_cmd_current(MOTOR_LEFT_CAN_ID, 0.0f);
       motor_cmd_current(MOTOR_RIGHT_CAN_ID, 0.0f);
       g_phase = PHASE_IDLE;
+      g_oneshot_active = 0; // STOP also aborts an in-progress one-shot cycle
+      g_oneshot_req = 0;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz control cycle
@@ -544,8 +598,21 @@ void motor_control_start() {
   if (!xTimerIsTimerActive(status_timer)) xTimerStart(status_timer, 0);
 }
 
-// Web UI: start / stop the movement sequence.
-void motor_control_run(bool run) { g_running = run; }
+// Web UI: start / stop the movement sequence. STOP also cancels any pending
+// or in-progress one-shot: clearing the active flag makes the control task
+// fall into its interrupt-style stop branch on the next cycle.
+void motor_control_run(bool run) {
+  g_running = run;
+  if (!run) {
+    g_oneshot_req = 0;
+    g_oneshot_active = 0;
+  }
+}
+
+// Web UI: request a one-shot pull->release cycle on one side
+// (ONESHOT_LEFT / ONESHOT_RIGHT). Ignored unless the system is fully idle;
+// consumed by the control task on its next cycle.
+void motor_oneshot(uint8_t side) { g_oneshot_req = side; }
 
 // Web UI status endpoint helper: current phase name.
 const char *motor_phase_name() { return phase_name(g_phase); }

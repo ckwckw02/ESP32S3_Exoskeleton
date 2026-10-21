@@ -25,12 +25,18 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-10-02</h1>
+  <h1>Motor Control 2026-10-21</h1>
 
   <div class="section">
     <h2>Run</h2>
     <button class="start" onclick="cmd('/start')">START</button>
     <button class="stop" onclick="cmd('/stop')">STOP</button>
+  </div>
+
+  <div class="section">
+    <h2>One-shot (pull &rarr; release)</h2>
+    <button class="origin" onclick="cmd('/oneshot_left')">LEFT once</button>
+    <button class="origin" onclick="cmd('/oneshot_right')">RIGHT once</button>
   </div>
 
   <div class="section">

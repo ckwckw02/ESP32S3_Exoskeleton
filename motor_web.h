@@ -36,6 +36,19 @@ static void handleStop() {
   server.send(200, "text/plain", "stopped");
 }
 
+// One-shot trigger: a single pull->release cycle on one side only. The control
+// task starts it on its next cycle if idle; it is ignored while running,
+// tight, or a one-shot is already in progress.
+static void handleOneshotLeft() {
+  motor_oneshot(ONESHOT_LEFT);
+  server.send(200, "text/plain", "left one-shot queued");
+}
+
+static void handleOneshotRight() {
+  motor_oneshot(ONESHOT_RIGHT);
+  server.send(200, "text/plain", "right one-shot queued");
+}
+
 // Tight mode: while active the control task streams TIGHT_DUTY (duty loop) to
 // both motors via comm_can_set_duty(). Stop sends a one-shot duty 0 so the
 // controllers don't keep driving after tight mode ends.
@@ -226,6 +239,8 @@ static void webserver_init() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/start", HTTP_GET, handleStart);
   server.on("/stop", HTTP_GET, handleStop);
+  server.on("/oneshot_left", HTTP_GET, handleOneshotLeft);
+  server.on("/oneshot_right", HTTP_GET, handleOneshotRight);
   server.on("/tight_start", HTTP_GET, handleTightStart);
   server.on("/tight_stop", HTTP_GET, handleTightStop);
   server.on("/set_origin_left", HTTP_GET, handleSetOriginLeft);
