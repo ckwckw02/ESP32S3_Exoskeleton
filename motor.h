@@ -2,6 +2,7 @@
 #define MOTOR_H
 
 #include <math.h>
+#include <string.h>
 #include "equation.h"
 #include "driver/twai.h"
 #include "freertos/FreeRTOS.h"
@@ -309,6 +310,22 @@ static uint32_t          g_phase_start_ms = 0; // when the current phase began
 // phase time limit elapses (safety timeout so we never hang).
 #define APPROACH_TOL_DEG 5.0f
 
+// Zero-crossing tolerance (deg) for the velocity-loop modes (RPM / equation).
+// A release phase ends when the motor is within this band of zero — coming
+// from negative: pos >= -tol (right), from positive: pos <= +tol (left) —
+// instead of requiring an exact zero crossing, which the motor overshoots
+// under velocity control before it can be stopped.
+#define ZERO_CROSS_TOL_DEG 15.0f
+
+// CAN feedback watchdog: if a motor sends no feedback frame for this long,
+// control is paused immediately (see control_task). Feedback normally arrives
+// many times per second, so 500 ms means the link is really gone.
+#define CAN_FB_TIMEOUT_MS 500
+
+// Set while the CAN feedback watchdog has tripped (any motor silent).
+// Cleared automatically once feedback returns; the user must restart control.
+static volatile bool     g_can_error = false;
+
 static const char *phase_name(motor_phase_t p) {
   // While a one-shot cycle runs, mark the phase so the status line shows it.
   if (g_oneshot_active) {
@@ -383,11 +400,48 @@ static void control_task(void *arg) {
       motor_poll(&rx);
     }
 
+    // --- CAN feedback watchdog ---
+    // Any motor silent for CAN_FB_TIMEOUT_MS means the link is gone: pause
+    // all control immediately (0 A current-loop = interrupt-style stop),
+    // clear every run request, and zero the stale status values so the web
+    // UI cannot keep showing pre-drop readings. The g_can_error flag stays
+    // set (web shows the CAN error warning) until fresh feedback returns;
+    // control is never auto-resumed — the user must start it again.
+    {
+      uint32_t now = millis();
+      bool fb_ok = (now - motor_left.update_time) < CAN_FB_TIMEOUT_MS &&
+                   (now - motor_right.update_time) < CAN_FB_TIMEOUT_MS;
+      if (g_can_error) {
+        if (fb_ok) {
+          g_can_error = false;
+          Serial.println("CAN feedback restored");
+        }
+      } else if (!fb_ok) {
+        g_can_error = true;
+        Serial.println("CAN FEEDBACK LOST - control paused");
+        // Cut torque on both motors (harmless no-ACK frames if the bus is down).
+        motor_cmd_current(MOTOR_LEFT_CAN_ID, 0.0f);
+        motor_cmd_current(MOTOR_RIGHT_CAN_ID, 0.0f);
+        // Drop every pending/active run request — nothing may auto-resume.
+        g_running = false;
+        g_tight = false;
+        g_oneshot_req = 0;
+        g_oneshot_active = 0;
+        g_phase = PHASE_IDLE;
+        // Reset stale motor status so the web UI shows zeros, not the last
+        // pre-drop snapshot.
+        portENTER_CRITICAL(&motor_mux);
+        memset(&motor_left, 0, sizeof(motor_left));
+        memset(&motor_right, 0, sizeof(motor_right));
+        portEXIT_CRITICAL(&motor_mux);
+      }
+    }
+
     // --- One-shot trigger: consume a pending request only when fully idle. ---
     // Starts a single pull->release cycle on the requested side: to-Pos (reel
     // in / 收繩) then to-Zero (release / 放繩), then back to Idle. The other
     // side is never commanded.
-    if (g_oneshot_req != 0 && !g_running && !g_tight &&
+    if (g_oneshot_req != 0 && !g_running && !g_tight && !g_can_error &&
         g_oneshot_active == 0 && g_phase == PHASE_IDLE) {
       g_oneshot_active = g_oneshot_req;
       g_oneshot_req = 0;
@@ -395,12 +449,12 @@ static void control_task(void *arg) {
       g_phase_start_ms = millis();
     }
 
-    if (g_tight) {
+    if (g_tight && !g_can_error) {
       // Tight mode: hold both motors at TIGHT_DUTY continuously.
       // Bypasses the movement state machine while active; it resumes on stop.
       motor_cmd_duty(MOTOR_LEFT_CAN_ID, TIGHT_DUTY);
       motor_cmd_duty(MOTOR_RIGHT_CAN_ID, -TIGHT_DUTY);
-    } else if (g_running || g_oneshot_active) {
+    } else if ((g_running || g_oneshot_active) && !g_can_error) {
       motor_params_t p;
       motor_params_get(&p);
 
@@ -470,8 +524,9 @@ static void control_task(void *arg) {
         //   speed-only / equation (velocity-loop modes, shared rule):
         //     lift (to-Pos)   — purely time-based, runs for exactly its time.
         //     release (to-Zero) — nominal time floor AND the motor must have
-        //       passed through zero even if the nominal time already elapsed:
-        //       right motor waits until pos >= 0, left until pos <= 0. No hard
+        //       entered the zero tolerance band (ZERO_CROSS_TOL_DEG) even if
+        //       the nominal time already elapsed: right comes from negative
+        //       (pos >= -tol), left from positive (pos <= +tol). No hard
         //       timeout — STOP aborts instead.
         bool done;
         if (p.mode == MODE_RPM || p.mode == MODE_EQUATION) {
@@ -480,13 +535,15 @@ static void control_task(void *arg) {
             // Lift: purely time-based.
             done = elapsed >= timeout;
           } else {
-            // Release: nominal time floor AND the motor must have passed through
-            // zero — right comes from negative (pos >= 0), left from positive
-            // (pos <= 0). No upper bound: a slow motor keeps releasing until it
-            // crosses; STOP is the abort mechanism.
-            bool crossed = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= 0.0f)
-                                                      : (st->motor_pos <= 0.0f);
-            done = (elapsed >= timeout) && crossed;
+            // Release: nominal time floor AND the motor must have reached the
+            // zero band — right comes from negative (pos >= -tol), left from
+            // positive (pos <= +tol). Stopping 15 deg short of zero avoids the
+            // overshoot that happens when braking only after an exact crossing.
+            // No upper bound: a slow motor keeps releasing until it gets there;
+            // STOP is the abort mechanism.
+            bool reached = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= -ZERO_CROSS_TOL_DEG)
+                                                      : (st->motor_pos <= ZERO_CROSS_TOL_DEG);
+            done = (elapsed >= timeout) && reached;
           }
         } else {
           done = motor_approached(st, target, timeout);
@@ -524,15 +581,22 @@ static void control_task(void *arg) {
         }
 
         // --- CAN TX: command the active motor at 100 Hz while its phase runs ---
-        if (p.mode == MODE_POS_SPD) {
-          motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
-        } else {
-          // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
-          // L->0 = -|Spd|. The other motor is held at rpm 0 every cycle because a
-          // velocity loop keeps its last commanded target.
-          uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
-          motor_cmd_rpm(id, signed_rpm);
-          motor_cmd_rpm(other_id, 0);
+        // Skipped when the one-shot just completed this cycle: the completion
+        // branch above already sent the final hold (rpm 0 / pos 0). Re-sending
+        // here would overwrite it with the release phase's rpm (computed before
+        // the transition) and, with no further TX after Idle, the velocity loop
+        // would drive the motor at release speed forever.
+        if (g_phase != PHASE_IDLE) {
+          if (p.mode == MODE_POS_SPD) {
+            motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
+          } else {
+            // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
+            // L->0 = -|Spd|. The other motor is held at rpm 0 every cycle because a
+            // velocity loop keeps its last commanded target.
+            uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
+            motor_cmd_rpm(id, signed_rpm);
+            motor_cmd_rpm(other_id, 0);
+          }
         }
       }
     } else if (g_phase != PHASE_IDLE) {
@@ -613,6 +677,9 @@ void motor_control_run(bool run) {
 // (ONESHOT_LEFT / ONESHOT_RIGHT). Ignored unless the system is fully idle;
 // consumed by the control task on its next cycle.
 void motor_oneshot(uint8_t side) { g_oneshot_req = side; }
+
+// Web UI / watchdog accessor: true while CAN feedback is missing.
+bool motor_can_error() { return g_can_error; }
 
 // Web UI status endpoint helper: current phase name.
 const char *motor_phase_name() { return phase_name(g_phase); }

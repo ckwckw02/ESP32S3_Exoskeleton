@@ -136,6 +136,13 @@ static void handleStatus() {
   motor_params_t p;
   motor_params_get(&p);
 
+  // CAN watchdog banner: shown first so it is impossible to miss. Control is
+  // paused by the control task while set; it clears when feedback returns.
+  if (motor_can_error()) {
+    s += "!! 電機CAN ERROR !!\n";
+    s += "電機CAN通訊中斷，控制已暫停，請檢查連線後重新開始\n";
+  }
+
   s += "running: ";
   s += g_running ? "YES" : "no";
   s += ", phase: "; s += motor_phase_name();

@@ -22,10 +22,13 @@ static const char INDEX_HTML[] = R"rawliteral(
     label { display: block; margin: 10px 0 3px; font-weight: bold; }
     input[type=number] { width: 100%; padding: 9px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
     .status { margin-top: 14px; padding: 12px; background: #fff; border: 1px solid #e0e0e0; border-radius: 10px; font-family: monospace; white-space: pre-wrap; font-size: 0.9em; }
+    .canerr { display: none; position: sticky; top: 0; z-index: 10; margin: 10px 0; padding: 14px; background: #dc3545; color: #fff; border-radius: 10px; font-weight: bold; text-align: center; font-size: 1.1em; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-10-21</h1>
+  <h1>Motor Control 2026-10-22</h1>
+
+  <div class="canerr" id="canerr">&#x96FB;&#x6A5F; CAN ERROR &#x2014; &#x63A7;&#x5236;&#x5DF2;&#x66AB;&#x505C;</div>
 
   <div class="section">
     <h2>Run</h2>
@@ -198,6 +201,10 @@ static const char INDEX_HTML[] = R"rawliteral(
         .then(function (r) { return r.text(); })
         .then(function (t) {
           document.getElementById('status').textContent = t;
+          // CAN watchdog banner: the /status body starts with the warning
+          // while feedback is missing.
+          var banner = document.getElementById('canerr');
+          if (banner) banner.style.display = (t.indexOf('CAN ERROR') >= 0) ? 'block' : 'none';
           // Keep the mode selector + visible sections in sync with the device.
           var mId = t.match(/^mode_id=(\d+)$/m);
           if (mId) {
