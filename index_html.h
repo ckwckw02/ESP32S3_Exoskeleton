@@ -77,7 +77,7 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="number" name="spd_pos" id="spd_pos" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_pos">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_pos" id="rpa_pos" value="60000" min="0" max="60000">
-      <label>Approach Pos time (ms)</label>
+      <label id="lbl_approach_pos">Lift time (ms) &mdash; Velocity Loop only</label>
       <input type="number" name="approach_pos" id="approach_pos" value="1000" min="50">
 
       <p style="margin:12px 0 4px; font-weight:bold;">To Zero (R&rarr;0, L&rarr;0)</p>
@@ -85,12 +85,22 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="number" name="spd_zero" id="spd_zero" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_zero">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_zero" id="rpa_zero" value="60000" min="0" max="60000">
-      <label>Approach Zero time (ms)</label>
+      <label id="lbl_approach_zero">Release nominal time (ms) &mdash; Velocity Loop only</label>
       <input type="number" name="approach_zero" id="approach_zero" value="1000" min="50">
 
       <p style="margin:12px 0 4px; font-weight:bold;">Shared</p>
       <label>Cooldown (ms)</label>
       <input type="number" name="cooldown" id="cooldown" value="0" min="0">
+      <button class="set" type="submit">Set</button>
+    </form>
+  </div>
+
+  <div class="section" id="overlap_section">
+    <h2>Overlap (Velocity Loop / Equation)</h2>
+    <p style="margin:4px 0; font-size:0.9em; color:#666;">Opposite side's lift starts this long before the release's nominal end &mdash; both motors run together (one lift, one release). 0 = disabled.</p>
+    <form onsubmit="return setOverlap(event)">
+      <label>Overlap (ms)</label>
+      <input type="number" name="overlap" id="overlap" value="100" min="0" max="5000">
       <button class="set" type="submit">Set</button>
     </form>
   </div>
@@ -163,14 +173,24 @@ static const char INDEX_HTML[] = R"rawliteral(
       fetch('/set_para?' + q).catch(function () {});
       return false;
     }
+    // Send the overlap window (velocity-loop modes) to the device.
+    function setOverlap(e) {
+      e.preventDefault();
+      var el = document.getElementById('overlap');
+      if (el) fetch('/set_para?overlap=' + encodeURIComponent(el.value)).catch(function () {});
+      return false;
+    }
     // Show/hide the sections and fields that don't apply to this mode.
-    // modeId: 0 = pos+spd (all parameter fields), 1 = RPM (hide pos + RPA),
-    // 2 = equation (hide Motor Parameters, show Equation section).
+    // modeId: 0 = pos+spd (pure position: no time fields, no overlap),
+    // 1 = RPM (hide pos + RPA, show overlap),
+    // 2 = equation (hide Motor Parameters, show Equation + overlap sections).
     function applyModeUI(modeId) {
       var paraSec = document.getElementById('para_section');
       if (paraSec) paraSec.style.display = (modeId === 2) ? 'none' : '';
       var eqSec = document.getElementById('eq_section');
       if (eqSec) eqSec.style.display = (modeId === 2) ? '' : 'none';
+      var ovSec = document.getElementById('overlap_section');
+      if (ovSec) ovSec.style.display = (modeId === 1 || modeId === 2) ? '' : 'none';
       // In RPM mode the pos + RPA fields don't apply; restore them otherwise.
       var rpmHide = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
       for (var i = 0; i < rpmHide.length; i++) {
@@ -178,6 +198,15 @@ static const char INDEX_HTML[] = R"rawliteral(
         if (el) el.style.display = (modeId === 1) ? 'none' : '';
         var lb = document.getElementById(rpmHide[i][1]);
         if (lb) lb.style.display = (modeId === 1) ? 'none' : '';
+      }
+      // In pos+spd mode the phase time fields don't apply (pure position
+      // control); restore them in RPM mode.
+      var spdHide = [['approach_pos','lbl_approach_pos'], ['approach_zero','lbl_approach_zero']];
+      for (var j = 0; j < spdHide.length; j++) {
+        var el2 = document.getElementById(spdHide[j][0]);
+        if (el2) el2.style.display = (modeId === 0) ? 'none' : '';
+        var lb2 = document.getElementById(spdHide[j][1]);
+        if (lb2) lb2.style.display = (modeId === 0) ? 'none' : '';
       }
     }
     // Stop auto-filling the inputs once the user starts editing them.
@@ -195,6 +224,10 @@ static const char INDEX_HTML[] = R"rawliteral(
     // so mark it touched immediately or auto-populate would re-check it.
     var pdCb0 = document.getElementById('eq_pd');
     if (pdCb0) pdCb0.addEventListener('change', function () { eqTouched = true; });
+    // Overlap field: stop auto-filling once edited.
+    var overlapTouched = false;
+    var ovEl0 = document.getElementById('overlap');
+    if (ovEl0) ovEl0.addEventListener('input', function () { overlapTouched = true; });
 
     setInterval(function () {
       fetch('/status')
@@ -219,6 +252,11 @@ static const char INDEX_HTML[] = R"rawliteral(
               var m = t.match(new RegExp('^' + PARA_IDS[j] + '=(-?[0-9.]+)', 'm'));
               if (m) document.getElementById(PARA_IDS[j]).value = parseFloat(m[1]);
             }
+          }
+          // Auto-populate the overlap field from the device until first edit.
+          if (!overlapTouched) {
+            var mo = t.match(/^overlap=(\d+)/m);
+            if (mo) { var ovEl = document.getElementById('overlap'); if (ovEl) ovEl.value = parseInt(mo[1], 10); }
           }
           // Auto-populate the equation inputs from the device until first edit.
           if (!eqTouched) {

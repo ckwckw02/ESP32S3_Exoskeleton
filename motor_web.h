@@ -97,6 +97,7 @@ static void handleSetPara() {
   if (server.hasArg("approach_zero"))  p.approach_zero_ms = constrain(server.arg("approach_zero").toInt(), 50, 60000);
   // shared
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
+  if (server.hasArg("overlap"))        p.overlap_ms = constrain(server.arg("overlap").toInt(), 0, 5000);
   // equation mode inputs
   if (server.hasArg("eq_T"))           p.T    = server.arg("eq_T").toFloat();
   if (server.hasArg("eq_SL"))          p.SL   = server.arg("eq_SL").toFloat();
@@ -164,6 +165,7 @@ static void handleStatus() {
   s += "\nrpa_zero="; s += (int)p.rpa_zero;
   s += "\napproach_zero="; s += p.approach_zero_ms;
   s += "\ncooldown="; s += p.cooldown_ms;
+  s += "\noverlap="; s += p.overlap_ms;
   s += " ms\n";
   // Equation mode inputs (always shown so the form can auto-populate).
   char eqline[48];

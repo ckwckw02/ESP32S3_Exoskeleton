@@ -157,7 +157,8 @@ void motor_poll(const twai_message_t *msg) {
 
 // Control mode — exactly one is active at a time (set from the web UI).
 typedef enum {
-  MODE_POS_SPD = 0,   // pos+spd loop: comm_can_set_pos_spd(target, Spd, RPA)
+  MODE_POS_SPD = 0,   // pos+spd loop: comm_can_set_pos_spd(target, Spd, RPA);
+                      // pure position control, no phase time limits
   MODE_RPM     = 1,   // speed-only loop: comm_can_set_rpm, time-based phases
   MODE_EQUATION= 2    // equation mode: computed lift/release rpm + times;
                       // release must pass through zero before advancing
@@ -168,13 +169,17 @@ typedef struct {
   float    pos;            // target position magnitude (deg), pos+spd mode only
   int32_t  spd_pos;        // speed for to-Pos phases, range -40000..40000
   int32_t  rpa_pos;        // acceleration for to-Pos phases, range 0..60000 (pos+spd only)
-  uint32_t approach_pos_ms;   // max time in a "to Pos" phase
+  uint32_t approach_pos_ms;   // lift phase duration — velocity-loop modes only (pos+spd is pure position now)
   // --- "To Zero" group (R->0 and L->0 phases, target is always 0) ---
   int32_t  spd_zero;       // speed for to-Zero phases, range -40000..40000
   int32_t  rpa_zero;       // acceleration for to-Zero phases (pos+spd only)
-  uint32_t approach_zero_ms;  // max time in a "to Zero" phase
+  uint32_t approach_zero_ms;  // release phase nominal time — velocity-loop modes only
   // --- shared ---
   uint32_t cooldown_ms;       // idle wait before each "to Pos" phase
+  // Cross-motor overlap window (velocity-loop modes only): the opposite side's
+  // lift starts this many ms before the leading release's nominal end, so both
+  // motors are commanded together for that window (one lift, one release).
+  uint32_t overlap_ms;
   // --- control mode (exactly one active at a time) ---
   motor_mode_t mode;          // MODE_POS_SPD / MODE_RPM / MODE_EQUATION
   // --- equation mode inputs (gait geometry, eq8-eq14) ---
@@ -203,6 +208,7 @@ static motor_params_t g_params = {
   .rpa_zero = 60000,
   .approach_zero_ms = 1000,
   .cooldown_ms = 0,
+  .overlap_ms = 100,
   .mode = MODE_POS_SPD,
   .T = 1.78f,
   .SL = 49.4f,
@@ -264,19 +270,27 @@ static void motor_equation_compute(motor_params_t *p) {
 //
 // Three control modes share this sequence:
 //   pos+spd loop : comm_can_set_pos_spd(target, Spd, RPA) to the active motor;
-//                  a phase ends when the position is reached or its time limit
-//                  elapses. Each group (to-Pos / to-Zero) has its own Spd/RPA/time.
+//                  a phase ends ONLY when the position is within tolerance of
+//                  the target (pure position control, no time limit — STOP or
+//                  the CAN watchdog are the abort mechanisms).
 //   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
 //                  comm_can_set_rpm(0) to the other one every cycle (a velocity
 //                  loop holds its last target, so the idle motor must be held).
 //                  Lift phases are purely time-based; release phases require the
-//                  motor to pass through zero before advancing (same rule as
+//                  motor to reach the zero band before advancing (same rule as
 //                  equation mode). Tune |Spd| x time ~= distance.
 //   equation     : like speed-only, but lift (to-Pos) and release (to-Zero)
 //                  rpm/times come from the gait-geometry model
 //                  (motor_equation_compute). Release phases additionally require
-//                  the motor to pass through zero before advancing, even past
+//                  the motor to reach the zero band before advancing, even past
 //                  their nominal time.
+//
+// Cross-motor overlap (speed-only + equation, continuous run only): during the
+// last overlap_ms of a release phase's nominal time the OPPOSITE side's lift
+// starts early, so both motors are commanded together for that window — one
+// lifting while the other releases (R->0 + L->Pos, then L->0 + R->Pos). The
+// early lift is bounded by its own nominal duration; the lift phase timer is
+// backdated to the overlap start so the total lift time stays correct.
 // ============================================================================
 typedef enum {
   PHASE_IDLE = 0,
@@ -347,11 +361,10 @@ static const char *phase_name(motor_phase_t p) {
   }
 }
 
-// True when the given motor is within tolerance of target, or the phase time
-// limit has elapsed (whichever comes first).
-static bool motor_approached(const motor_status_t *st, float target, uint32_t timeout_ms) {
-  if (fabsf(st->motor_pos - target) <= APPROACH_TOL_DEG) return true;
-  return (millis() - g_phase_start_ms) >= timeout_ms;
+// True when the given motor is within tolerance of target. Pure position check
+// for the pos+spd mode — no time limit; STOP / CAN watchdog abort instead.
+static bool motor_approached(const motor_status_t *st, float target) {
+  return fabsf(st->motor_pos - target) <= APPROACH_TOL_DEG;
 }
 
 // Send a pos_spd command with CAN TX serialization.
@@ -519,8 +532,21 @@ static void control_task(void *arg) {
         int32_t spd_abs    = cmd_spd < 0 ? -cmd_spd : cmd_spd;
         int32_t signed_rpm = (g_phase == PHASE_R_TO_POS || g_phase == PHASE_L_TO_ZERO) ? -spd_abs : +spd_abs;
 
+        uint32_t elapsed = millis() - g_phase_start_ms;
+
+        // Cross-motor overlap start (velocity-loop modes, release phases only):
+        // the opposite side's lift begins this many ms into the release phase,
+        // i.e. overlap_ms before its nominal end, so both motors run together
+        // for that window (one lift, one release). 0 disables the overlap.
+        // Never in one-shot mode: a one-shot cycle commands one side only.
+        uint32_t overlap_start = 0;
+        if (!is_pos_phase && !g_oneshot_active && p.mode != MODE_POS_SPD && p.overlap_ms > 0) {
+          overlap_start = (timeout > p.overlap_ms) ? (timeout - p.overlap_ms) : 0;
+        }
+
         // Phase complete? Advance to the next phase.
-        //   pos+spd mode: position within tolerance OR time limit elapsed.
+        //   pos+spd mode: position within tolerance of target — pure position
+        //     control, NO time limit (STOP / CAN watchdog abort instead).
         //   speed-only / equation (velocity-loop modes, shared rule):
         //     lift (to-Pos)   — purely time-based, runs for exactly its time.
         //     release (to-Zero) — nominal time floor AND the motor must have
@@ -530,7 +556,6 @@ static void control_task(void *arg) {
         //       timeout — STOP aborts instead.
         bool done;
         if (p.mode == MODE_RPM || p.mode == MODE_EQUATION) {
-          uint32_t elapsed = millis() - g_phase_start_ms;
           if (is_pos_phase) {
             // Lift: purely time-based.
             done = elapsed >= timeout;
@@ -546,13 +571,17 @@ static void control_task(void *arg) {
             done = (elapsed >= timeout) && reached;
           }
         } else {
-          done = motor_approached(st, target, timeout);
+          done = motor_approached(st, target);
         }
+        // Overlap window active this cycle? (The opposite side's lift started
+        // early and is running alongside this release phase.)
+        bool overlapped = (overlap_start > 0 && elapsed >= overlap_start);
+        bool tx_skip = false; // set when the transition adopts the early lift
         if (done) {
           if (g_oneshot_active) {
             // One-shot: only this side's to-Pos -> to-Zero runs; after the
             // to-Zero phase completes, go straight back to Idle (no cooldown,
-            // no opposite side).
+            // no overlap, no opposite side).
             if (g_phase == PHASE_R_TO_POS) {
               g_phase = PHASE_R_TO_ZERO;
             } else if (g_phase == PHASE_L_TO_POS) {
@@ -572,12 +601,25 @@ static void control_task(void *arg) {
             }
           } else switch (g_phase) {
             case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
-            case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
+            // Cooldown is skipped when the overlap already started the next
+            // lift — that motor is moving; an idle gap would stop it.
+            case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
             case PHASE_L_TO_POS:  g_next_phase = PHASE_L_TO_ZERO; g_phase = PHASE_L_TO_ZERO; break;
-            case PHASE_L_TO_ZERO: g_next_phase = PHASE_R_TO_POS;  g_phase = (p.cooldown_ms > 0) ? PHASE_COOLDOWN : PHASE_R_TO_POS; break; // cooldown before R->Pos (next cycle)
+            case PHASE_L_TO_ZERO: g_next_phase = PHASE_R_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_R_TO_POS; break; // cooldown before R->Pos (next cycle)
             default: break;
           }
-          g_phase_start_ms = millis();
+          if (overlapped && (g_phase == PHASE_L_TO_POS || g_phase == PHASE_R_TO_POS)) {
+            // The opposite lift is already running since the overlap opened:
+            // adopt it as the new phase, backdating the start to the overlap
+            // start so the total lift duration stays correct. Skip this
+            // cycle's TX so neither motor gets a glitch frame — both keep
+            // their last commanded values for one cycle.
+            g_phase_start_ms = g_phase_start_ms + overlap_start;
+            tx_skip = true;
+          } else {
+            g_phase_start_ms = millis();
+          }
+          overlap_start = 0; // never re-fire the overlap in this cycle's TX
         }
 
         // --- CAN TX: command the active motor at 100 Hz while its phase runs ---
@@ -586,16 +628,28 @@ static void control_task(void *arg) {
         // here would overwrite it with the release phase's rpm (computed before
         // the transition) and, with no further TX after Idle, the velocity loop
         // would drive the motor at release speed forever.
-        if (g_phase != PHASE_IDLE) {
+        // tx_skip: the transition adopted the early lift — both motors keep
+        // their last commanded frames for this cycle (no glitch).
+        if (g_phase != PHASE_IDLE && !tx_skip) {
           if (p.mode == MODE_POS_SPD) {
             motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
           } else {
             // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
             // L->0 = -|Spd|. The other motor is held at rpm 0 every cycle because a
-            // velocity loop keeps its last commanded target.
+            // velocity loop keeps its last commanded target — EXCEPT during the
+            // overlap window of a release phase, where the other motor runs its
+            // own lift instead (both motors commanded together).
             uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
+            int32_t other_rpm = 0;
+            if (overlap_start > 0 && elapsed >= overlap_start) {
+              // Overlap window open: opposite side lifts with the to-Pos speed,
+              // signed for its lift direction (R lift = -|Spd|, L lift = +|Spd|).
+              int32_t lift_spd = (p.mode == MODE_EQUATION) ? p.eq_lift_rpm : p.spd_pos;
+              int32_t lift_abs = lift_spd < 0 ? -lift_spd : lift_spd;
+              other_rpm = (other_id == MOTOR_RIGHT_CAN_ID) ? -lift_abs : +lift_abs;
+            }
             motor_cmd_rpm(id, signed_rpm);
-            motor_cmd_rpm(other_id, 0);
+            motor_cmd_rpm(other_id, other_rpm);
           }
         }
       }
