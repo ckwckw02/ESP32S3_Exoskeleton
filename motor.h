@@ -316,11 +316,12 @@ static motor_phase_t     g_phase = PHASE_IDLE;
 static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
 // Velocity-mode zero brake (control-task owned): a motor that enters the zero
-// band during a release phase is latched here and held at 0 A (torque cut)
-// instead of rpm 0 — the velocity loop at 0 rpm fights the elastic cable load
-// and oscillates (overshoot/drift), while 0 A lets the mechanism settle. Both
-// motors can be braked at once in continuous run, so this is a bitmask. Cleared
-// when a braked motor is commanded to lift again, and on stop / watchdog.
+// band during a release phase is latched here and held with comm_can_set_cb at
+// ZERO_BRAKE_CURRENT (active current braking) instead of rpm 0 — the velocity
+// loop at 0 rpm fights the elastic cable load and oscillates (overshoot/drift),
+// and a 0 A torque cut only free-coasts (huge overshoot at speed). Both motors
+// can be braked at once in continuous run, so this is a bitmask. Cleared when a
+// braked motor is commanded to lift again, and on stop / watchdog.
 #define BRAKE_LEFT  0x01
 #define BRAKE_RIGHT 0x02
 #define BRAKE_BIT(m) ((m) == MOTOR_LEFT_CAN_ID ? BRAKE_LEFT : BRAKE_RIGHT)
@@ -340,6 +341,13 @@ static uint8_t           g_brake_mask = 0;
 // instead of requiring an exact zero crossing, which the motor overshoots
 // under velocity control before it can be stopped.
 #define ZERO_CROSS_TOL_DEG 15.0f
+
+// Brake current (A) applied through comm_can_set_cb (current-brake mode) while
+// a motor is latched in the zero-band brake. Unlike a 0 A torque cut (free
+// coast, only friction slows the rotor — hundreds of degrees of overshoot at
+// high speed), the brake current actively opposes rotation and pulls the motor
+// to a stop.
+#define ZERO_BRAKE_CURRENT 0.5f
 
 // CAN feedback watchdog: if a motor sends no feedback frame for this long,
 // control is paused immediately (see control_task). Feedback normally arrives
@@ -396,6 +404,16 @@ static void motor_cmd_rpm(uint8_t id, int32_t rpm) {
 static void motor_cmd_current(uint8_t id, float current) {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
   comm_can_set_current(id, current);
+  xSemaphoreGive(can_tx_mux);
+}
+
+// Send a current-BRAKE command (comm_can_set_cb) with CAN TX serialization.
+// Unlike the 0 A torque cut (free coast — the rotor only slows on friction and
+// overshoots hundreds of degrees at high speed), the brake current actively
+// opposes rotation. Used for the zero-band brake hold (ZERO_BRAKE_CURRENT).
+static void motor_cmd_cb(uint8_t id, float current) {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_cb(id, current);
   xSemaphoreGive(can_tx_mux);
 }
 
@@ -499,11 +517,11 @@ static void control_task(void *arg) {
           g_phase = g_next_phase;
           g_phase_start_ms = millis();
         } else if (p.mode != MODE_POS_SPD) {
-          // Hold both motors during the gap, but keep any zero-band motor at
-          // 0 A (an rpm 0 frame would override the brake and re-oscillate it).
-          if (g_brake_mask & BRAKE_LEFT)  motor_cmd_current(MOTOR_LEFT_CAN_ID, 0.0f);
+          // Hold both motors during the gap, but keep any zero-band motor on
+          // its current brake (an rpm 0 frame would override it and re-oscillate).
+          if (g_brake_mask & BRAKE_LEFT)  motor_cmd_cb(MOTOR_LEFT_CAN_ID, ZERO_BRAKE_CURRENT);
           else                            motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
-          if (g_brake_mask & BRAKE_RIGHT) motor_cmd_current(MOTOR_RIGHT_CAN_ID, 0.0f);
+          if (g_brake_mask & BRAKE_RIGHT) motor_cmd_cb(MOTOR_RIGHT_CAN_ID, ZERO_BRAKE_CURRENT);
           else                            motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
         }
       } else {
@@ -607,13 +625,14 @@ static void control_task(void *arg) {
               g_phase = PHASE_L_TO_ZERO;
             } else {
               // One-shot complete: hold the motor at zero. In velocity modes it
-              // is already latched in the zero brake (0 A), so keep it there —
-              // a velocity loop at rpm 0 would oscillate against the cable load.
+              // is already latched in the zero brake (current brake), so keep it
+              // there — a velocity loop at rpm 0 would oscillate against the
+              // cable load, and a 0 A cut would free-coast.
               if (p.mode == MODE_POS_SPD) {
                 motor_cmd_pos_spd(id, 0.0f, cmd_spd, cmd_rpa);
               } else {
                 uint8_t other = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
-                if (g_brake_mask & BRAKE_BIT(id)) motor_cmd_current(id, 0.0f);
+                if (g_brake_mask & BRAKE_BIT(id)) motor_cmd_cb(id, ZERO_BRAKE_CURRENT);
                 else                              motor_cmd_rpm(id, 0);
                 motor_cmd_rpm(other, 0);
               }
@@ -674,18 +693,19 @@ static void control_task(void *arg) {
               other_lift = true;
               g_brake_mask &= ~BRAKE_BIT(other_id);
             }
-            // Active motor: latched at the zero band → hold 0 A (torque cut)
-            // instead of driving release rpm through zero (overshoot source).
+            // Active motor: latched at the zero band → hold the current brake
+            // (ZERO_BRAKE_CURRENT) instead of driving release rpm through zero
+            // (overshoot source) or free-coasting at 0 A (no braking torque).
             if (g_brake_mask & BRAKE_BIT(id)) {
-              motor_cmd_current(id, 0.0f);
+              motor_cmd_cb(id, ZERO_BRAKE_CURRENT);
             } else {
               motor_cmd_rpm(id, signed_rpm);
             }
-            // Other motor: overlap lift, braked 0 A hold, or plain rpm 0 hold.
+            // Other motor: overlap lift, braked hold, or plain rpm 0 hold.
             if (other_lift) {
               motor_cmd_rpm(other_id, other_rpm);
             } else if (g_brake_mask & BRAKE_BIT(other_id)) {
-              motor_cmd_current(other_id, 0.0f);
+              motor_cmd_cb(other_id, ZERO_BRAKE_CURRENT);
             } else {
               motor_cmd_rpm(other_id, 0);
             }
