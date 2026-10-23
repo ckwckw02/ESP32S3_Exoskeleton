@@ -26,7 +26,7 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-10-22</h1>
+  <h1>Motor Control 2026-10-23</h1>
 
   <div class="canerr" id="canerr">&#x96FB;&#x6A5F; CAN ERROR &#x2014; &#x63A7;&#x5236;&#x5DF2;&#x66AB;&#x505C;</div>
 
