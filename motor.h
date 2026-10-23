@@ -315,6 +315,16 @@ static uint8_t           g_oneshot_active = 0; // one-shot cycle in progress
 static motor_phase_t     g_phase = PHASE_IDLE;
 static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
+// Velocity-mode zero brake (control-task owned): a motor that enters the zero
+// band during a release phase is latched here and held at 0 A (torque cut)
+// instead of rpm 0 — the velocity loop at 0 rpm fights the elastic cable load
+// and oscillates (overshoot/drift), while 0 A lets the mechanism settle. Both
+// motors can be braked at once in continuous run, so this is a bitmask. Cleared
+// when a braked motor is commanded to lift again, and on stop / watchdog.
+#define BRAKE_LEFT  0x01
+#define BRAKE_RIGHT 0x02
+#define BRAKE_BIT(m) ((m) == MOTOR_LEFT_CAN_ID ? BRAKE_LEFT : BRAKE_RIGHT)
+static uint8_t           g_brake_mask = 0;
 
 // Duty applied to both motors while tight mode is active (duty loop, 0..1).
 #define TIGHT_DUTY 0.03f
@@ -441,6 +451,7 @@ static void control_task(void *arg) {
         g_oneshot_req = 0;
         g_oneshot_active = 0;
         g_phase = PHASE_IDLE;
+        g_brake_mask = 0;
         // Reset stale motor status so the web UI shows zeros, not the last
         // pre-drop snapshot.
         portENTER_CRITICAL(&motor_mux);
@@ -488,8 +499,12 @@ static void control_task(void *arg) {
           g_phase = g_next_phase;
           g_phase_start_ms = millis();
         } else if (p.mode != MODE_POS_SPD) {
-          motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
-          motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
+          // Hold both motors during the gap, but keep any zero-band motor at
+          // 0 A (an rpm 0 frame would override the brake and re-oscillate it).
+          if (g_brake_mask & BRAKE_LEFT)  motor_cmd_current(MOTOR_LEFT_CAN_ID, 0.0f);
+          else                            motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
+          if (g_brake_mask & BRAKE_RIGHT) motor_cmd_current(MOTOR_RIGHT_CAN_ID, 0.0f);
+          else                            motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
         }
       } else {
         // Determine the active motor, its target and which parameter group applies.
@@ -562,13 +577,17 @@ static void control_task(void *arg) {
           } else {
             // Release: nominal time floor AND the motor must have reached the
             // zero band — right comes from negative (pos >= -tol), left from
-            // positive (pos <= +tol). Stopping 15 deg short of zero avoids the
-            // overshoot that happens when braking only after an exact crossing.
-            // No upper bound: a slow motor keeps releasing until it gets there;
-            // STOP is the abort mechanism.
+            // positive (pos <= +tol). On entering the band the motor is
+            // LATCHED into the zero brake (g_brake_mask): the TX block below
+            // then holds it at 0 A (torque cut) instead of continuing to drive
+            // at release rpm — a velocity loop cannot stop precisely and
+            // overshoots through zero, then oscillates (rpm 0 hold fights the
+            // elastic cable load). No upper bound: a slow motor keeps releasing
+            // until it gets there; STOP is the abort mechanism.
             bool reached = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= -ZERO_CROSS_TOL_DEG)
                                                       : (st->motor_pos <= ZERO_CROSS_TOL_DEG);
-            done = (elapsed >= timeout) && reached;
+            if (reached) g_brake_mask |= BRAKE_BIT(id); // latch the zero-band 0 A brake
+            done = (elapsed >= timeout) && ((g_brake_mask & BRAKE_BIT(id)) != 0);
           }
         } else {
           done = motor_approached(st, target);
@@ -587,13 +606,15 @@ static void control_task(void *arg) {
             } else if (g_phase == PHASE_L_TO_POS) {
               g_phase = PHASE_L_TO_ZERO;
             } else {
-              // One-shot complete: hold the motor at zero so a velocity loop
-              // does not keep driving at its last rpm once commands stop.
+              // One-shot complete: hold the motor at zero. In velocity modes it
+              // is already latched in the zero brake (0 A), so keep it there —
+              // a velocity loop at rpm 0 would oscillate against the cable load.
               if (p.mode == MODE_POS_SPD) {
                 motor_cmd_pos_spd(id, 0.0f, cmd_spd, cmd_rpa);
               } else {
                 uint8_t other = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
-                motor_cmd_rpm(id, 0);
+                if (g_brake_mask & BRAKE_BIT(id)) motor_cmd_current(id, 0.0f);
+                else                              motor_cmd_rpm(id, 0);
                 motor_cmd_rpm(other, 0);
               }
               g_phase = PHASE_IDLE;
@@ -640,16 +661,34 @@ static void control_task(void *arg) {
             // overlap window of a release phase, where the other motor runs its
             // own lift instead (both motors commanded together).
             uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
+            // A motor commanded to lift leaves the 0 A brake (velocity resumes).
+            if (is_pos_phase) g_brake_mask &= ~BRAKE_BIT(id);
             int32_t other_rpm = 0;
+            bool other_lift = false;
             if (overlap_start > 0 && elapsed >= overlap_start) {
               // Overlap window open: opposite side lifts with the to-Pos speed,
               // signed for its lift direction (R lift = -|Spd|, L lift = +|Spd|).
               int32_t lift_spd = (p.mode == MODE_EQUATION) ? p.eq_lift_rpm : p.spd_pos;
               int32_t lift_abs = lift_spd < 0 ? -lift_spd : lift_spd;
               other_rpm = (other_id == MOTOR_RIGHT_CAN_ID) ? -lift_abs : +lift_abs;
+              other_lift = true;
+              g_brake_mask &= ~BRAKE_BIT(other_id);
             }
-            motor_cmd_rpm(id, signed_rpm);
-            motor_cmd_rpm(other_id, other_rpm);
+            // Active motor: latched at the zero band → hold 0 A (torque cut)
+            // instead of driving release rpm through zero (overshoot source).
+            if (g_brake_mask & BRAKE_BIT(id)) {
+              motor_cmd_current(id, 0.0f);
+            } else {
+              motor_cmd_rpm(id, signed_rpm);
+            }
+            // Other motor: overlap lift, braked 0 A hold, or plain rpm 0 hold.
+            if (other_lift) {
+              motor_cmd_rpm(other_id, other_rpm);
+            } else if (g_brake_mask & BRAKE_BIT(other_id)) {
+              motor_cmd_current(other_id, 0.0f);
+            } else {
+              motor_cmd_rpm(other_id, 0);
+            }
           }
         }
       }
@@ -664,6 +703,7 @@ static void control_task(void *arg) {
       g_phase = PHASE_IDLE;
       g_oneshot_active = 0; // STOP also aborts an in-progress one-shot cycle
       g_oneshot_req = 0;
+      g_brake_mask = 0;     // motors are already at 0 A; reset the latch
     }
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz control cycle

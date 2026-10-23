@@ -6,7 +6,7 @@ Wi-Fi, BT 5 (LE), Dual Core + LP Core, 240MHz, Embedded PSRAM 8MB (AP_3v3)
 ## Arduino IDE setting
 
 - **Board:** "XIAO_ESP32S3"
-- **Port:** "COM12"
+- **Port:** "ESP32 Family Device"
 - **USB CDC On Boot:** "Enabled"
 - **CPU Frequency:** "240MHz (WiFi)"
 - **Core Debug Level:** "Error"
