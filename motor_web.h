@@ -137,13 +137,6 @@ static void handleStatus() {
   motor_params_t p;
   motor_params_get(&p);
 
-  // CAN watchdog banner: shown first so it is impossible to miss. Control is
-  // paused by the control task while set; it clears when feedback returns.
-  if (motor_can_error()) {
-    s += "!! 電機CAN ERROR !!\n";
-    s += "電機CAN通訊中斷，控制已暫停，請檢查連線後重新開始\n";
-  }
-
   s += "running: ";
   s += g_running ? "YES" : "no";
   s += ", phase: "; s += motor_phase_name();
@@ -155,6 +148,11 @@ static void handleStatus() {
   s += "\n";
   // Machine-readable mode id so the page can sync its selector.
   s += "mode_id="; s += (int)p.mode;
+  s += "\n";
+  // CAN watchdog: which motors have no feedback (bit0=left, bit1=right).
+  // The page shows its floating banner from this; the status text itself
+  // stays clean.
+  s += "can_err="; s += (int)motor_can_error_mask();
   s += "\n";
   // One field per line so the web page can parse and auto-populate the form.
   s += "pos="; s += p.pos;

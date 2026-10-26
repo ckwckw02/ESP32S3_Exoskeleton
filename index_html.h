@@ -22,18 +22,22 @@ static const char INDEX_HTML[] = R"rawliteral(
     label { display: block; margin: 10px 0 3px; font-weight: bold; }
     input[type=number] { width: 100%; padding: 9px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
     .status { margin-top: 14px; padding: 12px; background: #fff; border: 1px solid #e0e0e0; border-radius: 10px; font-family: monospace; white-space: pre-wrap; font-size: 0.9em; }
-    .canerr { display: none; position: sticky; top: 0; z-index: 10; margin: 10px 0; padding: 14px; background: #dc3545; color: #fff; border-radius: 10px; font-weight: bold; text-align: center; font-size: 1.1em; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+    .floatbar { position: sticky; top: 0; z-index: 10; }
+    .floatbar .section { margin: 10px 0; box-shadow: 0 2px 6px rgba(0,0,0,.15); }
+    .canerr { display: none; margin: 10px 0; padding: 14px; background: #dc3545; color: #fff; border-radius: 10px; font-weight: bold; text-align: center; font-size: 1.1em; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-10-23</h1>
+  <h1>Motor Control 2026-10-26</h1>
 
-  <div class="canerr" id="canerr">&#x96FB;&#x6A5F; CAN ERROR &#x2014; &#x63A7;&#x5236;&#x5DF2;&#x66AB;&#x505C;</div>
+  <div class="floatbar">
+    <div class="canerr" id="canerr"></div>
 
-  <div class="section">
-    <h2>Run</h2>
-    <button class="start" onclick="cmd('/start')">START</button>
-    <button class="stop" onclick="cmd('/stop')">STOP</button>
+    <div class="section">
+      <h2>Run</h2>
+      <button class="start" onclick="cmd('/start')">START</button>
+      <button class="stop" onclick="cmd('/stop')">STOP</button>
+    </div>
   </div>
 
   <div class="section">
@@ -67,6 +71,7 @@ static const char INDEX_HTML[] = R"rawliteral(
     <button class="stop" onclick="cmd('/tight_stop')">Stop</button>
   </div>
 
+  <div id="para_group">
   <div class="section" id="para_section">
     <h2>Motor Parameters</h2>
     <form onsubmit="return setPara(event)">
@@ -93,16 +98,17 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="number" name="cooldown" id="cooldown" value="0" min="0">
       <button class="set" type="submit">Set</button>
     </form>
-  </div>
 
-  <div class="section" id="overlap_section">
-    <h2>Overlap (Velocity Loop / Equation)</h2>
-    <p style="margin:4px 0; font-size:0.9em; color:#666;">Opposite side's lift starts this long before the release's nominal end &mdash; both motors run together (one lift, one release). 0 = disabled.</p>
-    <form onsubmit="return setOverlap(event)">
-      <label>Overlap (ms)</label>
-      <input type="number" name="overlap" id="overlap" value="100" min="0" max="5000">
-      <button class="set" type="submit">Set</button>
-    </form>
+    <div id="overlap_section">
+      <h2 style="margin-top:14px;">Overlap (Velocity Loop / Equation)</h2>
+      <p style="margin:4px 0; font-size:0.9em; color:#666;">Opposite side's lift starts this long before the release's nominal end &mdash; both motors run together (one lift, one release). 0 = disabled.</p>
+      <form onsubmit="return setOverlap(event)">
+        <label>Overlap (ms)</label>
+        <input type="number" name="overlap" id="overlap" value="0" min="0" max="5000">
+        <button class="set" type="submit">Set</button>
+      </form>
+    </div>
+  </div>
   </div>
 
   <div class="section" id="eq_section">
@@ -185,12 +191,13 @@ static const char INDEX_HTML[] = R"rawliteral(
     // 1 = RPM (hide pos + RPA, show overlap),
     // 2 = equation (hide Motor Parameters, show Equation + overlap sections).
     function applyModeUI(modeId) {
-      var paraSec = document.getElementById('para_section');
-      if (paraSec) paraSec.style.display = (modeId === 2) ? 'none' : '';
+      // para_section + overlap_section are one group: hidden in equation mode.
+      var paraGrp = document.getElementById('para_group');
+      if (paraGrp) paraGrp.style.display = (modeId === 2) ? 'none' : '';
       var eqSec = document.getElementById('eq_section');
       if (eqSec) eqSec.style.display = (modeId === 2) ? '' : 'none';
       var ovSec = document.getElementById('overlap_section');
-      if (ovSec) ovSec.style.display = (modeId === 1 || modeId === 2) ? '' : 'none';
+      if (ovSec) ovSec.style.display = (modeId === 1) ? '' : 'none';
       // In RPM mode the pos + RPA fields don't apply; restore them otherwise.
       var rpmHide = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
       for (var i = 0; i < rpmHide.length; i++) {
@@ -234,10 +241,17 @@ static const char INDEX_HTML[] = R"rawliteral(
         .then(function (r) { return r.text(); })
         .then(function (t) {
           document.getElementById('status').textContent = t;
-          // CAN watchdog banner: the /status body starts with the warning
-          // while feedback is missing.
+          // CAN watchdog floating banner: which motors lost feedback
+          // (can_err bits: 1=left, 2=right, 3=both). Status text stays clean.
           var banner = document.getElementById('canerr');
-          if (banner) banner.style.display = (t.indexOf('CAN ERROR') >= 0) ? 'block' : 'none';
+          if (banner) {
+            var ce = t.match(/^can_err=(\d+)/m);
+            var v = ce ? parseInt(ce[1], 10) : 0;
+            if (v === 1)      { banner.textContent = '\u96FB\u6A5F CAN ERROR (LEFT) \u2014 \u63A7\u5236\u5DF2\u66AB\u505C'; banner.style.display = 'block'; }
+            else if (v === 2) { banner.textContent = '\u96FB\u6A5F CAN ERROR (RIGHT) \u2014 \u63A7\u5236\u5DF2\u66AB\u505C'; banner.style.display = 'block'; }
+            else if (v === 3) { banner.textContent = '\u96FB\u6A5F CAN ERROR (LEFT + RIGHT) \u2014 \u63A7\u5236\u5DF2\u66AB\u505C'; banner.style.display = 'block'; }
+            else              { banner.style.display = 'none'; }
+          }
           // Keep the mode selector + visible sections in sync with the device.
           var mId = t.match(/^mode_id=(\d+)$/m);
           if (mId) {
