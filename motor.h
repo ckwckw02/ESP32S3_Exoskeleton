@@ -289,7 +289,10 @@ static void motor_equation_compute(motor_params_t *p) {
 // last overlap_ms of a release phase's nominal time the OPPOSITE side's lift
 // starts early, so both motors are commanded together for that window — one
 // lifting while the other releases (R->0 + L->Pos, then L->0 + R->Pos). The
-// early lift is bounded by its own nominal duration; the lift phase timer is
+// overlap lift drive is hard-capped at the nominal lift time: a release that
+// runs past its nominal time (slow motor, late zero-band latch) must not keep
+// driving the opposite lift, or every late cycle adds travel to the next peak
+// and the position ratchets higher each cycle. The lift phase timer is
 // backdated to the overlap start so the total lift time stays correct.
 // ============================================================================
 typedef enum {
@@ -585,6 +588,9 @@ static void control_task(void *arg) {
         if (!is_pos_phase && !g_oneshot_active && p.mode != MODE_POS_SPD && p.overlap_ms > 0) {
           overlap_start = (timeout > p.overlap_ms) ? (timeout - p.overlap_ms) : 0;
         }
+        // Nominal lift duration of the opposite side — the hard cap for the
+        // overlap lift drive (see the TX block).
+        uint32_t lift_timeout = (p.mode == MODE_EQUATION) ? p.eq_lift_ms : p.approach_pos_ms;
 
         // Phase complete? Advance to the next phase.
         //   pos+spd mode: position within tolerance of target — pure position
@@ -693,7 +699,14 @@ static void control_task(void *arg) {
             if (is_pos_phase) g_brake_mask &= ~BRAKE_BIT(id);
             int32_t other_rpm = 0;
             bool other_lift = false;
-            if (overlap_start > 0 && elapsed >= overlap_start) {
+            // The overlap lift drive is hard-capped at the nominal lift time:
+            // a release phase that runs past its nominal time (slow motor,
+            // late zero-band latch) must NOT keep driving the opposite lift
+            // beyond lift_timeout, or every late cycle adds travel to the next
+            // peak and the position ratchets higher each cycle. Once capped,
+            // the lifted motor falls through to the rpm 0 / brake hold below.
+            if (overlap_start > 0 && elapsed >= overlap_start &&
+                (elapsed - overlap_start) < lift_timeout) {
               // Overlap window open: opposite side lifts with the to-Pos speed,
               // signed for its lift direction (R lift = -|Spd|, L lift = +|Spd|).
               int32_t lift_spd = (p.mode == MODE_EQUATION) ? p.eq_lift_rpm : p.spd_pos;
