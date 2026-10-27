@@ -200,12 +200,12 @@ typedef struct {
 
 static motor_params_t g_params = {
   .pos = 360.0f,
-  .spd_pos = 40000,
-  .rpa_pos = 60000,
-  .approach_pos_ms = 1000,
-  .spd_zero = 40000,
-  .rpa_zero = 60000,
-  .approach_zero_ms = 1000,
+  .spd_pos = 10000,
+  .rpa_pos = 10000,
+  .approach_pos_ms = 500,
+  .spd_zero = 10000,
+  .rpa_zero = 10000,
+  .approach_zero_ms = 500,
   .cooldown_ms = 0,
   .overlap_ms = 0,
   .mode = MODE_POS_SPD,
