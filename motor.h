@@ -276,24 +276,26 @@ static void motor_equation_compute(motor_params_t *p) {
 //   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
 //                  comm_can_set_rpm(0) to the other one every cycle (a velocity
 //                  loop holds its last target, so the idle motor must be held).
-//                  Lift phases are purely time-based; release phases require the
-//                  motor to reach the zero band before advancing (same rule as
-//                  equation mode). Tune |Spd| x time ~= distance.
+//                  Lift and release phases are both purely time-based; a motor
+//                  still short of the zero band when its release ends keeps
+//                  releasing in the background (see the overlap note below).
 //   equation     : like speed-only, but lift (to-Pos) and release (to-Zero)
 //                  rpm/times come from the gait-geometry model
-//                  (motor_equation_compute). Release phases additionally require
-//                  the motor to reach the zero band before advancing, even past
-//                  their nominal time.
+//                  (motor_equation_compute).
 //
-// Cross-motor overlap (speed-only + equation, continuous run only): during the
-// last overlap_ms of a release phase's nominal time the OPPOSITE side's lift
-// starts early, so both motors are commanded together for that window — one
-// lifting while the other releases (R->0 + L->Pos, then L->0 + R->Pos). The
-// overlap lift drive is hard-capped at the nominal lift time: a release that
-// runs past its nominal time (slow motor, late zero-band latch) must not keep
-// driving the opposite lift, or every late cycle adds travel to the next peak
-// and the position ratchets higher each cycle. The lift phase timer is
-// backdated to the overlap start so the total lift time stays correct.
+// Cross-motor overlap (speed-only + equation, continuous run only): release
+// phases end on their NOMINAL time — the cadence is a pure time schedule and
+// never slips — so the opposite side's lift always starts exactly overlap_ms
+// before the release's nominal end, both motors commanded together for that
+// window (R->0 + L->Pos, then L->0 + R->Pos). A motor that has not entered the
+// zero band (ZERO_CROSS_TOL_DEG) when its release phase ends is handed to the
+// background release path (g_release_pending): the TX path keeps driving it at
+// release rpm until it reaches the band, then latches the current brake. The
+// overlap lift drive is hard-capped at the nominal lift time so a late phase
+// can never extend the opposite lift (that ratcheted the peak higher each
+// cycle). The lift phase timer is backdated to the overlap start so the total
+// lift time stays correct. One-shot runs keep the old rule: the final release
+// must reach the zero band before returning to Idle.
 // ============================================================================
 typedef enum {
   PHASE_IDLE = 0,
@@ -329,6 +331,14 @@ static uint32_t          g_phase_start_ms = 0; // when the current phase began
 #define BRAKE_RIGHT 0x02
 #define BRAKE_BIT(m) ((m) == MOTOR_LEFT_CAN_ID ? BRAKE_LEFT : BRAKE_RIGHT)
 static uint8_t           g_brake_mask = 0;
+
+// Background release (control-task owned): the release phase ends on its
+// nominal schedule even when the motor has not entered the zero band yet, so
+// the lift/release cadence never slips. A motor still on its way to zero is
+// flagged here; the TX path keeps driving it at release rpm until it enters
+// the band and latches the brake. Cleared on latch, when the motor is
+// commanded to lift again, and on stop / watchdog.
+static uint8_t           g_release_pending = 0;
 
 // Duty applied to both motors while tight mode is active (duty loop, 0..1).
 #define TIGHT_DUTY 0.03f
@@ -432,6 +442,30 @@ static void motor_cmd_duty(uint8_t id, float duty) {
   xSemaphoreGive(can_tx_mux);
 }
 
+// Hold a motor that is finishing its release in the background (its release
+// phase already ended on schedule). While pending: keep driving release rpm
+// (R->0 = +|Spd|, L->0 = -|Spd|) until it enters the zero band, then latch and
+// hold the current brake. Already-done motors keep their brake or an rpm 0
+// hold. Used by the idle/other-motor TX paths and the cooldown gap.
+static void motor_release_hold(uint8_t id, const motor_params_t *p) {
+  if (g_release_pending & BRAKE_BIT(id)) {
+    const motor_status_t *st = (id == MOTOR_RIGHT_CAN_ID) ? &motor_right : &motor_left;
+    bool reached = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= -ZERO_CROSS_TOL_DEG)
+                                              : (st->motor_pos <= ZERO_CROSS_TOL_DEG);
+    if (reached) {
+      g_release_pending &= ~BRAKE_BIT(id);
+      g_brake_mask |= BRAKE_BIT(id);
+    } else {
+      int32_t rel = (p->mode == MODE_EQUATION) ? p->eq_release_rpm : p->spd_zero;
+      int32_t rel_abs = rel < 0 ? -rel : rel;
+      motor_cmd_rpm(id, (id == MOTOR_RIGHT_CAN_ID) ? +rel_abs : -rel_abs); // R->0 = +, L->0 = -
+      return;
+    }
+  }
+  if (g_brake_mask & BRAKE_BIT(id)) motor_cmd_cb(id, ZERO_BRAKE_CURRENT);
+  else                              motor_cmd_rpm(id, 0);
+}
+
 // ============================================================================
 // Control task: runs at 100 Hz (CAN RX + TX rate).
 //   - drains all pending TWAI frames into the motor status structs
@@ -478,6 +512,7 @@ static void control_task(void *arg) {
           g_oneshot_active = 0;
           g_phase = PHASE_IDLE;
           g_brake_mask = 0;
+          g_release_pending = 0;
           // Reset stale motor status so the web UI shows zeros, not the last
           // pre-drop snapshot.
           portENTER_CRITICAL(&motor_mux);
@@ -529,12 +564,11 @@ static void control_task(void *arg) {
           g_phase = g_next_phase;
           g_phase_start_ms = millis();
         } else if (p.mode != MODE_POS_SPD) {
-          // Hold both motors during the gap, but keep any zero-band motor on
-          // its current brake (an rpm 0 frame would override it and re-oscillate).
-          if (g_brake_mask & BRAKE_LEFT)  motor_cmd_cb(MOTOR_LEFT_CAN_ID, ZERO_BRAKE_CURRENT);
-          else                            motor_cmd_rpm(MOTOR_LEFT_CAN_ID, 0);
-          if (g_brake_mask & BRAKE_RIGHT) motor_cmd_cb(MOTOR_RIGHT_CAN_ID, ZERO_BRAKE_CURRENT);
-          else                            motor_cmd_rpm(MOTOR_RIGHT_CAN_ID, 0);
+          // Hold both motors during the gap: background releases keep going
+          // toward zero, braked motors keep their current brake (an rpm 0
+          // frame would override it and re-oscillate), the rest sit at rpm 0.
+          motor_release_hold(MOTOR_LEFT_CAN_ID, &p);
+          motor_release_hold(MOTOR_RIGHT_CAN_ID, &p);
         }
       } else {
         // Determine the active motor, its target and which parameter group applies.
@@ -597,30 +631,32 @@ static void control_task(void *arg) {
         //     control, NO time limit (STOP / CAN watchdog abort instead).
         //   speed-only / equation (velocity-loop modes, shared rule):
         //     lift (to-Pos)   — purely time-based, runs for exactly its time.
-        //     release (to-Zero) — nominal time floor AND the motor must have
-        //       entered the zero tolerance band (ZERO_CROSS_TOL_DEG) even if
-        //       the nominal time already elapsed: right comes from negative
-        //       (pos >= -tol), left from positive (pos <= +tol). No hard
-        //       timeout — STOP aborts instead.
+        //     release (to-Zero) — purely time-based too: the phase ends on its
+        //       nominal schedule so the cadence never slips. A motor that has
+        //       entered the zero band (ZERO_CROSS_TOL_DEG) is latched into the
+        //       current brake; one that has not is handed to the background
+        //       release path and keeps releasing while the next lift runs.
         bool done;
         if (p.mode == MODE_RPM || p.mode == MODE_EQUATION) {
           if (is_pos_phase) {
             // Lift: purely time-based.
             done = elapsed >= timeout;
           } else {
-            // Release: nominal time floor AND the motor must have reached the
-            // zero band — right comes from negative (pos >= -tol), left from
-            // positive (pos <= +tol). On entering the band the motor is
-            // LATCHED into the zero brake (g_brake_mask): the TX block below
-            // then holds it at 0 A (torque cut) instead of continuing to drive
-            // at release rpm — a velocity loop cannot stop precisely and
-            // overshoots through zero, then oscillates (rpm 0 hold fights the
-            // elastic cable load). No upper bound: a slow motor keeps releasing
-            // until it gets there; STOP is the abort mechanism.
+            // Release: purely time-scheduled — the phase always ends at its
+            // nominal time so the whole cadence keeps its clock and the next
+            // lift starts exactly overlap_ms before this phase's end, even if
+            // this release has not finished. A motor that entered the zero
+            // band is latched into the current brake; one that has not is
+            // handed to the background release path (g_release_pending) and
+            // keeps releasing while the next lift runs. One-shot keeps the
+            // old rule: its final release must reach the band before Idle.
             bool reached = (id == MOTOR_RIGHT_CAN_ID) ? (st->motor_pos >= -ZERO_CROSS_TOL_DEG)
                                                       : (st->motor_pos <= ZERO_CROSS_TOL_DEG);
-            if (reached) g_brake_mask |= BRAKE_BIT(id); // latch the zero-band 0 A brake
-            done = (elapsed >= timeout) && ((g_brake_mask & BRAKE_BIT(id)) != 0);
+            if (reached) g_brake_mask |= BRAKE_BIT(id); // latch the zero-band brake
+            if (g_oneshot_active)
+              done = (elapsed >= timeout) && ((g_brake_mask & BRAKE_BIT(id)) != 0);
+            else
+              done = elapsed >= timeout;
           }
         } else {
           done = motor_approached(st, target);
@@ -654,14 +690,25 @@ static void control_task(void *arg) {
               g_phase = PHASE_IDLE;
               g_oneshot_active = 0;
             }
-          } else switch (g_phase) {
-            case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
-            // Cooldown is skipped when the overlap already started the next
-            // lift — that motor is moving; an idle gap would stop it.
-            case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
-            case PHASE_L_TO_POS:  g_next_phase = PHASE_L_TO_ZERO; g_phase = PHASE_L_TO_ZERO; break;
-            case PHASE_L_TO_ZERO: g_next_phase = PHASE_R_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_R_TO_POS; break; // cooldown before R->Pos (next cycle)
-            default: break;
+          } else {
+            motor_phase_t prev = g_phase;
+            switch (g_phase) {
+              case PHASE_R_TO_POS:  g_next_phase = PHASE_R_TO_ZERO; g_phase = PHASE_R_TO_ZERO; break;
+              // Cooldown is skipped when the overlap already started the next
+              // lift — that motor is moving; an idle gap would stop it.
+              case PHASE_R_TO_ZERO: g_next_phase = PHASE_L_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_L_TO_POS; break; // cooldown before L->Pos
+              case PHASE_L_TO_POS:  g_next_phase = PHASE_L_TO_ZERO; g_phase = PHASE_L_TO_ZERO; break;
+              case PHASE_L_TO_ZERO: g_next_phase = PHASE_R_TO_POS;  g_phase = (p.cooldown_ms > 0 && !overlapped) ? PHASE_COOLDOWN : PHASE_R_TO_POS; break; // cooldown before R->Pos (next cycle)
+              default: break;
+            }
+            // A release phase that ended on schedule (velocity modes only):
+            // hand a not-yet-zeroed motor to the background release path; a
+            // braked one is done. pos+spd mode holds position on its own.
+            if (p.mode != MODE_POS_SPD &&
+                (prev == PHASE_R_TO_ZERO || prev == PHASE_L_TO_ZERO)) {
+              if (g_brake_mask & BRAKE_BIT(id)) g_release_pending &= ~BRAKE_BIT(id);
+              else                              g_release_pending |= BRAKE_BIT(id);
+            }
           }
           if (overlapped && (g_phase == PHASE_L_TO_POS || g_phase == PHASE_R_TO_POS)) {
             // The opposite lift is already running since the overlap opened:
@@ -695,8 +742,12 @@ static void control_task(void *arg) {
             // overlap window of a release phase, where the other motor runs its
             // own lift instead (both motors commanded together).
             uint8_t other_id = (id == MOTOR_RIGHT_CAN_ID) ? MOTOR_LEFT_CAN_ID : MOTOR_RIGHT_CAN_ID;
-            // A motor commanded to lift leaves the 0 A brake (velocity resumes).
-            if (is_pos_phase) g_brake_mask &= ~BRAKE_BIT(id);
+            // A motor commanded to lift leaves the brake and any background
+            // release (velocity resumes toward the lift target).
+            if (is_pos_phase) {
+              g_brake_mask &= ~BRAKE_BIT(id);
+              g_release_pending &= ~BRAKE_BIT(id);
+            }
             int32_t other_rpm = 0;
             bool other_lift = false;
             // The overlap lift drive is hard-capped at the nominal lift time:
@@ -714,6 +765,7 @@ static void control_task(void *arg) {
               other_rpm = (other_id == MOTOR_RIGHT_CAN_ID) ? -lift_abs : +lift_abs;
               other_lift = true;
               g_brake_mask &= ~BRAKE_BIT(other_id);
+              g_release_pending &= ~BRAKE_BIT(other_id);
             }
             // Active motor: latched at the zero band → hold the current brake
             // (ZERO_BRAKE_CURRENT) instead of driving release rpm through zero
@@ -723,13 +775,11 @@ static void control_task(void *arg) {
             } else {
               motor_cmd_rpm(id, signed_rpm);
             }
-            // Other motor: overlap lift, braked hold, or plain rpm 0 hold.
+            // Other motor: overlap lift, or background release / brake / rpm 0.
             if (other_lift) {
               motor_cmd_rpm(other_id, other_rpm);
-            } else if (g_brake_mask & BRAKE_BIT(other_id)) {
-              motor_cmd_cb(other_id, ZERO_BRAKE_CURRENT);
             } else {
-              motor_cmd_rpm(other_id, 0);
+              motor_release_hold(other_id, &p);
             }
           }
         }
@@ -746,6 +796,7 @@ static void control_task(void *arg) {
       g_oneshot_active = 0; // STOP also aborts an in-progress one-shot cycle
       g_oneshot_req = 0;
       g_brake_mask = 0;     // motors are already at 0 A; reset the latch
+      g_release_pending = 0;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz control cycle
