@@ -56,6 +56,9 @@ static const char INDEX_HTML[] = R"rawliteral(
     </label><br>
     <label style="font-weight:normal; display:inline;">
       <input type="radio" name="mode_sel" value="2" onchange="setMode(2)"> Equation
+    </label><br>
+    <label style="font-weight:normal; display:inline;">
+      <input type="radio" name="mode_sel" value="3" onchange="setMode(3)"> Position Loop
     </label>
   </div>
 
@@ -76,9 +79,9 @@ static const char INDEX_HTML[] = R"rawliteral(
     <h2>Motor Parameters</h2>
     <form onsubmit="return setPara(event)">
       <p style="margin:4px 0; font-weight:bold;">To Pos (R&rarr;Pos, L&rarr;Pos)</p>
-      <label id="lbl_pos">Pos (deg) &mdash; Position Velocity Loop only</label>
+      <label id="lbl_pos">Pos (deg) &mdash; Position Velocity / Position Loop only</label>
       <input type="number" step="any" name="pos" id="pos" value="360">
-      <label>Spd (-40000..40000)</label>
+      <label id="lbl_spd_pos">Spd (-40000..40000) &mdash; not used by Position Loop</label>
       <input type="number" name="spd_pos" id="spd_pos" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_pos">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_pos" id="rpa_pos" value="60000" min="0" max="60000">
@@ -86,7 +89,7 @@ static const char INDEX_HTML[] = R"rawliteral(
       <input type="number" name="approach_pos" id="approach_pos" value="1000" min="50">
 
       <p style="margin:12px 0 4px; font-weight:bold;">To Zero (R&rarr;0, L&rarr;0)</p>
-      <label>Spd (-40000..40000)</label>
+      <label id="lbl_spd_zero">Spd (-40000..40000) &mdash; not used by Position Loop</label>
       <input type="number" name="spd_zero" id="spd_zero" value="40000" min="-40000" max="40000">
       <label id="lbl_rpa_zero">RPA (0..60000) &mdash; Position Velocity Loop only</label>
       <input type="number" name="rpa_zero" id="rpa_zero" value="60000" min="0" max="60000">
@@ -144,7 +147,8 @@ static const char INDEX_HTML[] = R"rawliteral(
     function cmd(path) {
       fetch(path).catch(function () {});
     }
-    // mode: 0 = pos+spd, 1 = speed-only (RPM), 2 = equation. Exactly one active.
+    // mode: 0 = pos+spd, 1 = speed-only (RPM), 2 = equation, 3 = position loop.
+    // Exactly one active.
     function setMode(m) {
       fetch('/set_mode?mode=' + m).catch(function () {});
     }
@@ -189,7 +193,8 @@ static const char INDEX_HTML[] = R"rawliteral(
     // Show/hide the sections and fields that don't apply to this mode.
     // modeId: 0 = pos+spd (pure position: no time fields, no overlap),
     // 1 = RPM (hide pos + RPA, show overlap),
-    // 2 = equation (hide Motor Parameters, show Equation + overlap sections).
+    // 2 = equation (hide Motor Parameters, show Equation + overlap sections),
+    // 3 = position loop (only Pos applies: no Spd, no RPA, no time, no overlap).
     function applyModeUI(modeId) {
       // para_section + overlap_section are one group: hidden in equation mode.
       var paraGrp = document.getElementById('para_group');
@@ -207,13 +212,24 @@ static const char INDEX_HTML[] = R"rawliteral(
         if (lb) lb.style.display = (modeId === 1) ? 'none' : '';
       }
       // In pos+spd mode the phase time fields don't apply (pure position
-      // control); restore them in RPM mode.
+      // control); restore them in RPM mode. They never apply in position-loop
+      // mode either (no time constant).
       var spdHide = [['approach_pos','lbl_approach_pos'], ['approach_zero','lbl_approach_zero']];
       for (var j = 0; j < spdHide.length; j++) {
         var el2 = document.getElementById(spdHide[j][0]);
-        if (el2) el2.style.display = (modeId === 0) ? 'none' : '';
+        if (el2) el2.style.display = (modeId === 0 || modeId === 3) ? 'none' : '';
         var lb2 = document.getElementById(spdHide[j][1]);
-        if (lb2) lb2.style.display = (modeId === 0) ? 'none' : '';
+        if (lb2) lb2.style.display = (modeId === 0 || modeId === 3) ? 'none' : '';
+      }
+      // Position-loop mode: comm_can_set_pos takes only a target position, so
+      // the Spd and RPA fields don't apply.
+      var posHide = [['spd_pos','lbl_spd_pos'], ['spd_zero','lbl_spd_zero'],
+                     ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
+      for (var k2 = 0; k2 < posHide.length; k2++) {
+        var el3 = document.getElementById(posHide[k2][0]);
+        if (el3) el3.style.display = (modeId === 3) ? 'none' : '';
+        var lb3 = document.getElementById(posHide[k2][1]);
+        if (lb3) lb3.style.display = (modeId === 3) ? 'none' : '';
       }
     }
     // Stop auto-filling the inputs once the user starts editing them.

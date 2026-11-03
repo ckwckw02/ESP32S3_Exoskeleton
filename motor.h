@@ -160,12 +160,23 @@ typedef enum {
   MODE_POS_SPD = 0,   // pos+spd loop: comm_can_set_pos_spd(target, Spd, RPA);
                       // pure position control, no phase time limits
   MODE_RPM     = 1,   // speed-only loop: comm_can_set_rpm, time-based phases
-  MODE_EQUATION= 2    // equation mode: computed lift/release rpm + times
+  MODE_EQUATION= 2,   // equation mode: computed lift/release rpm + times
+  MODE_POS     = 3    // position loop: comm_can_set_pos(target) only; no speed,
+                      // no acceleration and no phase time limit — a phase ends
+                      // when the motor is within APPROACH_TOL_DEG of its target
 } motor_mode_t;
+
+// True for the velocity-loop modes (RPM / equation), whose phases are driven by
+// comm_can_set_rpm and bounded by nominal times. The position modes (pos+spd,
+// position) hold their last target on the controller and end on position
+// tolerance instead.
+static inline bool mode_is_velocity(motor_mode_t m) {
+  return m == MODE_RPM || m == MODE_EQUATION;
+}
 
 typedef struct {
   // --- "To Pos" group (R->Pos and L->Pos phases) ---
-  float    pos;            // target position magnitude (deg), pos+spd mode only
+  float    pos;            // target position magnitude (deg), position modes only
   int32_t  spd_pos;        // speed for to-Pos phases, range -40000..40000
   int32_t  rpa_pos;        // acceleration for to-Pos phases, range 0..60000 (pos+spd only)
   uint32_t approach_pos_ms;   // lift phase duration — velocity-loop modes only (pos+spd is pure position now)
@@ -180,7 +191,7 @@ typedef struct {
   // motors are commanded together for that window (one lift, one release).
   uint32_t overlap_ms;
   // --- control mode (exactly one active at a time) ---
-  motor_mode_t mode;          // MODE_POS_SPD / MODE_RPM / MODE_EQUATION
+  motor_mode_t mode;          // MODE_POS_SPD / MODE_RPM / MODE_EQUATION / MODE_POS
   // --- equation mode inputs (gait geometry, eq8-eq14) ---
   float    T;                 // gait cycle period (s)
   float    SL;                // step length (cm)
@@ -267,11 +278,14 @@ static void motor_equation_compute(motor_params_t *p) {
 //   L -> Pos  (cooldown first, wait until approached)
 //   L -> 0    (wait until approached)
 //
-// Three control modes share this sequence:
+// Four control modes share this sequence:
 //   pos+spd loop : comm_can_set_pos_spd(target, Spd, RPA) to the active motor;
 //                  a phase ends ONLY when the position is within tolerance of
 //                  the target (pure position control, no time limit — STOP or
 //                  the CAN watchdog are the abort mechanisms).
+//   position loop: comm_can_set_pos(target) to the active motor only — no speed,
+//                  no acceleration and NO time constant at all. Like pos+spd, a
+//                  phase ends ONLY when |pos - target| <= APPROACH_TOL_DEG.
 //   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
 //                  comm_can_set_rpm(0) to the other one every cycle (a velocity
 //                  loop holds its last target, so the idle motor must be held).
@@ -350,7 +364,9 @@ static uint8_t           g_release_pending = 0;
 
 // Position tolerance (deg) used to decide that a motor has "approached" its
 // target. A motor counts as arrived when |pos - target| <= this value OR the
-// phase time limit elapses (safety timeout so we never hang).
+// phase time limit elapses (safety timeout so we never hang). The position-loop
+// modes (pos+spd / position) have no time limit at all, so for them this
+// tolerance is the ONLY thing that ends a phase.
 #define APPROACH_TOL_DEG 5.0f
 
 // Zero-crossing tolerance (deg) for the velocity-loop modes (RPM / equation).
@@ -403,7 +419,8 @@ static const char *phase_name(motor_phase_t p) {
 }
 
 // True when the given motor is within tolerance of target. Pure position check
-// for the pos+spd mode — no time limit; STOP / CAN watchdog abort instead.
+// for the position-loop modes (pos+spd / position) — no time limit; STOP / CAN
+// watchdog abort instead.
 static bool motor_approached(const motor_status_t *st, float target) {
   return fabsf(st->motor_pos - target) <= APPROACH_TOL_DEG;
 }
@@ -412,6 +429,15 @@ static bool motor_approached(const motor_status_t *st, float target) {
 static void motor_cmd_pos_spd(uint8_t id, float pos, int32_t spd, int32_t rpa) {
   xSemaphoreTake(can_tx_mux, portMAX_DELAY);
   comm_can_set_pos_spd(id, pos, spd, rpa);
+  xSemaphoreGive(can_tx_mux);
+}
+
+// Send a position-loop command (comm_can_set_pos) with CAN TX serialization.
+// Position-only: the controller's own position loop decides the trajectory, so
+// there is no speed, acceleration or time constant on our side.
+static void motor_cmd_pos(uint8_t id, float pos) {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_pos(id, pos);
   xSemaphoreGive(can_tx_mux);
 }
 
@@ -471,7 +497,8 @@ static void motor_cmd_duty(uint8_t id, float duty) {
 //   - drains all pending TWAI frames into the motor status structs
 //   - advances the movement state machine
 //   - re-sends the active motor's command every cycle (100 Hz):
-//     pos+spd mode -> comm_can_set_pos_spd; speed-only -> comm_can_set_rpm
+//     pos+spd mode -> comm_can_set_pos_spd; position mode -> comm_can_set_pos;
+//     speed-only -> comm_can_set_rpm
 //   - on STOP, cuts torque immediately with a 0 A current-loop command to
 //     both motors (interrupt-style stop, all modes)
 // ============================================================================
@@ -563,7 +590,7 @@ static void control_task(void *arg) {
         if ((millis() - g_phase_start_ms) >= p.cooldown_ms) {
           g_phase = g_next_phase;
           g_phase_start_ms = millis();
-        } else if (p.mode != MODE_POS_SPD) {
+        } else if (mode_is_velocity(p.mode)) {
           // Hold both motors during the gap: a motor still finishing its
           // release (g_release_pending) keeps driving toward the zero band,
           // a zero-band motor stays on its current brake (an rpm 0 frame
@@ -624,7 +651,7 @@ static void control_task(void *arg) {
         // for that window (one lift, one release). 0 disables the overlap.
         // Never in one-shot mode: a one-shot cycle commands one side only.
         uint32_t overlap_start = 0;
-        if (!is_pos_phase && !g_oneshot_active && p.mode != MODE_POS_SPD && p.overlap_ms > 0) {
+        if (!is_pos_phase && !g_oneshot_active && mode_is_velocity(p.mode) && p.overlap_ms > 0) {
           overlap_start = (timeout > p.overlap_ms) ? (timeout - p.overlap_ms) : 0;
         }
         // Nominal lift duration of the opposite side — the hard cap for the
@@ -632,15 +659,16 @@ static void control_task(void *arg) {
         uint32_t lift_timeout = (p.mode == MODE_EQUATION) ? p.eq_lift_ms : p.approach_pos_ms;
 
         // Phase complete? Advance to the next phase.
-        //   pos+spd mode: position within tolerance of target — pure position
-        //     control, NO time limit (STOP / CAN watchdog abort instead).
+        //   position modes (pos+spd / position): position within tolerance of
+        //     target (APPROACH_TOL_DEG) — pure position control, NO time limit
+        //     (STOP / CAN watchdog abort instead).
         //   speed-only / equation (velocity-loop modes): BOTH lift and release
         //     are purely time-based — a fixed schedule. The next lift always
         //     starts overlap_ms before the current release's nominal end, even
         //     if that release motor has not physically reached the zero band
         //     yet; the phase never waits for it.
         bool done;
-        if (p.mode == MODE_RPM || p.mode == MODE_EQUATION) {
+        if (mode_is_velocity(p.mode)) {
           if (is_pos_phase) {
             // Lift: purely time-based.
             done = elapsed >= timeout;
@@ -684,6 +712,10 @@ static void control_task(void *arg) {
               // cable load, and a 0 A cut would free-coast.
               if (p.mode == MODE_POS_SPD) {
                 motor_cmd_pos_spd(id, 0.0f, cmd_spd, cmd_rpa);
+              } else if (p.mode == MODE_POS) {
+                // Position loop holds its last target, so a final pos 0 command
+                // parks the motor at the origin.
+                motor_cmd_pos(id, 0.0f);
               } else {
                 // Brake-aware hold on BOTH motors: whichever is latched in the
                 // zero band (the finished side, or the idle side resting at
@@ -704,7 +736,7 @@ static void control_task(void *arg) {
             // paths below). Without this the lagging side would sit at rpm 0
             // short of zero and the next lift would start from there,
             // ratcheting the position up cycle after cycle.
-            if (!is_pos_phase && (p.mode == MODE_RPM || p.mode == MODE_EQUATION) &&
+            if (!is_pos_phase && mode_is_velocity(p.mode) &&
                 !(g_brake_mask & BRAKE_BIT(id))) {
               g_release_pending |= BRAKE_BIT(id);
             }
@@ -743,6 +775,12 @@ static void control_task(void *arg) {
         if (g_phase != PHASE_IDLE && !tx_skip) {
           if (p.mode == MODE_POS_SPD) {
             motor_cmd_pos_spd(id, target, cmd_spd, cmd_rpa);
+          } else if (p.mode == MODE_POS) {
+            // Position loop: only the target position goes on the bus — no
+            // speed, no acceleration and no time constant. The controller's own
+            // position loop runs the move; the opposite motor keeps its last
+            // target (the controller holds it), so no hold frames are needed.
+            motor_cmd_pos(id, target);
           } else {
             // Speed-only loop: R->Pos = -|Spd|, R->0 = +|Spd|, L->Pos = +|Spd|,
             // L->0 = -|Spd|. The other motor is held at rpm 0 every cycle because a

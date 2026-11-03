@@ -115,20 +115,22 @@ static void handleSetPara() {
 }
 
 // Set the control mode: ?mode=0 -> pos+spd loop (comm_can_set_pos_spd),
-// ?mode=1 -> speed-only loop (comm_can_set_rpm), ?mode=2 -> equation mode.
+// ?mode=1 -> speed-only loop (comm_can_set_rpm), ?mode=2 -> equation mode,
+// ?mode=3 -> position loop (comm_can_set_pos, no time constant).
 // Takes effect immediately; exactly one mode is active at a time.
 static void handleSetMode() {
   motor_params_t p;
   motor_params_get(&p);
 
-  if (server.hasArg("mode")) p.mode = (motor_mode_t)constrain(server.arg("mode").toInt(), 0, 2);
+  if (server.hasArg("mode")) p.mode = (motor_mode_t)constrain(server.arg("mode").toInt(), 0, 3);
 
   // Refresh the equation outputs when switching into equation mode.
   if (p.mode == MODE_EQUATION) motor_equation_compute(&p);
 
   motor_params_set(&p);
   const char *name = (p.mode == MODE_POS_SPD) ? "mode: pos_spd" :
-                     (p.mode == MODE_RPM)     ? "mode: rpm"     : "mode: equation";
+                     (p.mode == MODE_RPM)     ? "mode: rpm"     :
+                     (p.mode == MODE_POS)     ? "mode: pos"     : "mode: equation";
   server.send(200, "text/plain", name);
 }
 
@@ -143,6 +145,7 @@ static void handleStatus() {
   s += ", mode: ";
   if (p.mode == MODE_POS_SPD)      s += "POS_SPD (pos+spd)";
   else if (p.mode == MODE_RPM)     s += "RPM (speed-only)";
+  else if (p.mode == MODE_POS)     s += "POS (position loop)";
   else                             s += "EQUATION (equation)";
   s += ", tight: "; s += g_tight ? "YES" : "no";
   s += "\n";
