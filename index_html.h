@@ -28,7 +28,7 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-11-03</h1>
+  <h1>Motor Control 2026-11-12</h1>
 
   <div class="floatbar">
     <div class="canerr" id="canerr"></div>
@@ -42,8 +42,14 @@ static const char INDEX_HTML[] = R"rawliteral(
 
   <div class="section">
     <h2>One-shot (pull &rarr; release)</h2>
-    <button class="origin" onclick="cmd('/oneshot_left')">LEFT once</button>
-    <button class="origin" onclick="cmd('/oneshot_right')">RIGHT once</button>
+    <label style="font-weight:normal; display:inline; margin-bottom:6px;">
+      <input type="checkbox" id="oneshot_en" onchange="setOneshot(this.checked)"> Enable one-shot (safety)
+    </label>
+    <div id="oneshot_btns" style="opacity:.35; pointer-events:none;">
+      <button class="origin" onclick="cmd('/oneshot_left')">LEFT once</button>
+      <button class="origin" onclick="cmd('/oneshot_right')">RIGHT once</button>
+    </div>
+    <p style="margin:6px 0 0; font-size:0.85em; color:#666;">Disabled by default. Turn the switch on before the buttons will accept a request; turning it off also aborts a running one-shot.</p>
   </div>
 
   <div class="section">
@@ -69,7 +75,15 @@ static const char INDEX_HTML[] = R"rawliteral(
   </div>
 
   <div class="section">
-    <h2>Tight (duty 0.3)</h2>
+    <h2>Tight</h2>
+    <label>Duty cycle (0 &ndash; 1.0)</label>
+    <div style="display:flex; align-items:center;">
+      <input type="range" id="tight_range" min="0" max="1" step="0.01" value="0.03"
+             oninput="setTightDuty(this.value, 'range')" style="width:100%; margin:0 8px 0 0;">
+      <input type="number" id="tight" step="0.01" min="0" max="1" value="0.03"
+             onchange="setTightDuty(this.value, 'num')" style="width:80px; margin:0;">
+    </div>
+    <p style="margin:6px 0 0; font-size:0.85em; color:#666;">Applies immediately, also while tight mode is running.</p>
     <button class="start" onclick="cmd('/tight_start')">Start</button>
     <button class="stop" onclick="cmd('/tight_stop')">Stop</button>
   </div>
@@ -190,6 +204,41 @@ static const char INDEX_HTML[] = R"rawliteral(
       if (el) fetch('/set_para?overlap=' + encodeURIComponent(el.value)).catch(function () {});
       return false;
     }
+    // One-shot safety switch: the device rejects every one-shot request while
+    // it is off (the default), so the buttons are also greyed out locally.
+    // oneshotPending keeps the 100 ms status poll from briefly reverting the
+    // checkbox while the /set_oneshot request is still in flight.
+    var oneshotPending = false;
+    function setOneshot(on) {
+      applyOneshotUI(on);
+      oneshotPending = true;
+      fetch('/set_oneshot?on=' + (on ? 1 : 0))
+        .then(function () { oneshotPending = false; })
+        .catch(function () { oneshotPending = false; });
+    }
+    function applyOneshotUI(on) {
+      var box = document.getElementById('oneshot_btns');
+      if (box) {
+        box.style.opacity = on ? '' : '.35';
+        box.style.pointerEvents = on ? '' : 'none';
+      }
+    }
+    // Tight duty cycle (0..1.0): keep the slider and the number box in sync and
+    // push the value immediately so it also applies while tight mode runs.
+    // src: 'range' when the slider moved, 'num' when the number box did.
+    var tightTouched = false;
+    function setTightDuty(v, src) {
+      var d = parseFloat(v);
+      if (isNaN(d)) return;
+      if (d < 0) d = 0;
+      if (d > 1) d = 1;
+      var rg = document.getElementById('tight_range');
+      var nb = document.getElementById('tight');
+      if (src === 'range') { if (nb) nb.value = d; }
+      else { if (rg) rg.value = d; }
+      tightTouched = true;
+      fetch('/set_para?tight=' + encodeURIComponent(d)).catch(function () {});
+    }
     // Show/hide the sections and fields that don't apply to this mode.
     // modeId: 0 = pos+spd (pure position: no time fields, no overlap),
     // 1 = RPM (hide pos + RPA, show overlap),
@@ -275,6 +324,28 @@ static const char INDEX_HTML[] = R"rawliteral(
             var sel = document.querySelector('input[name="mode_sel"][value="' + id + '"]');
             if (sel && !sel.checked) sel.checked = true;
             applyModeUI(id);
+          }
+          // Sync the one-shot safety switch with the device (unless a toggle of
+          // ours is still in flight).
+          if (!oneshotPending) {
+            var mo2 = t.match(/^oneshot_enabled=(\d+)$/m);
+            var enCb = document.getElementById('oneshot_en');
+            if (mo2 && enCb) {
+              var en = parseInt(mo2[1], 10) !== 0;
+              if (enCb.checked !== en) enCb.checked = en;
+              applyOneshotUI(en);
+            }
+          }
+          // Auto-populate the tight duty controls from the device until first edit.
+          if (!tightTouched) {
+            var mt = t.match(/^tight=(\d+\.\d+)/m);
+            if (mt) {
+              var dv = parseFloat(mt[1]);
+              var rg2 = document.getElementById('tight_range');
+              var nb2 = document.getElementById('tight');
+              if (rg2) rg2.value = dv;
+              if (nb2) nb2.value = dv;
+            }
           }
           // Auto-populate the parameter inputs from the device until first edit.
           if (!paramsTouched) {

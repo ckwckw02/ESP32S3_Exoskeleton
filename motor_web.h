@@ -14,7 +14,127 @@ static const char *WIFI_SSID = "MotorControl";
 static const char *WIFI_PASS = "12345678";
 
 // ---- Web server (port 80) ----
-static WebServer server(80);
+// HTTP/1.1 keep-alive web server.
+//
+// The stock WebServer always answers with "Connection: close" and releases the
+// TCP connection right after each response, so every one of the page's /status
+// polls (every 100 ms) pays a fresh connect + teardown. This subclass answers
+// "Connection: keep-alive" instead and keeps the connection open, which removes
+// that per-request latency.
+//
+// How it hooks the library without duplicating its connection state machine:
+//   * _currentClientWrite() is the single choke point every response passes
+//     through, and a response's whole header block arrives there as one
+//     contiguous buffer starting with the status line — so the token can be
+//     swapped in a private copy (content writes never match).
+//   * The base handleClient() releases _currentClient at the end of the very
+//     call that sent the response. Holding our own NetworkClient copy across
+//     that call keeps the socket's shared handle alive, so "releasing" is a
+//     no-op and the same connection can be handed back and re-armed in
+//     HC_WAIT_READ for the next pipelined request.
+//   * The idle hold is deliberately short (KEEP_ALIVE_IDLE_MS) and always
+//     shorter than a browser's own keep-alive timeout, so the server closes
+//     first and the client never writes into a half-closed socket.
+// A client that asks for "Connection: close" gets exactly that, and anything
+// that cannot be rewritten is sent untouched (still closing) — always safe.
+//
+// Trade-off: like the stock server this handles one connection at a time, so a
+// held connection blocks another client for up to KEEP_ALIVE_IDLE_MS after the
+// last request. The page polls every 100 ms, so the timeout never fires while
+// the page is open; it only reclaims the slot once the browser goes away.
+#define KEEP_ALIVE_IDLE_MS 1500
+
+class KeepAliveWebServer : public WebServer {
+public:
+  explicit KeepAliveWebServer(int port) : WebServer(port) {}
+
+  void handleClient() override {
+    // Keep a reference to the socket the response was written to: the base
+    // class drops _currentClient at the end of this same call.
+    _held = NetworkClient();
+    WebServer::handleClient();
+    const bool responded = (bool)_held; // a keep-alive response just went out
+
+    if (_held) {
+      _currentClient = _held;
+      _currentStatus = HC_WAIT_READ;
+      _statusChange = millis();
+      _held = NetworkClient(); // _currentClient owns the socket again
+    }
+
+    if (_currentStatus != HC_WAIT_READ || !_currentClient) {
+      _idle_since_ms = millis(); // not holding a connection open
+      return;
+    }
+
+    // Activity (a response just went out, or a new request is pending) restarts
+    // the idle timer; otherwise close once it expires so another client can take
+    // the single connection slot, and so the browser never reuses a connection
+    // the network stack has already dropped.
+    if (responded || _currentClient.available()) {
+      _idle_since_ms = millis();
+    } else if ((millis() - _idle_since_ms) > KEEP_ALIVE_IDLE_MS) {
+      _currentClient.stop();
+      _currentClient = NetworkClient();
+      _currentStatus = HC_NONE;
+      _idle_since_ms = millis();
+    }
+  }
+
+protected:
+  size_t _currentClientWrite(const char *b, size_t l) override {
+    // Only response header blocks start with the status line, so content
+    // writes (which could legitimately contain the token) are never touched.
+    if (l > 8 && l < sizeof(_patched) - 8 && memcmp(b, "HTTP/1.", 7) == 0) {
+      // The request is already parsed at this point, so the client's own
+      // "Connection" preference is readable (webserver_init collects it).
+      // Keep-alive is promised only to HTTP/1.1+ clients that did not ask to
+      // close; everything else keeps the stock "Connection: close" behaviour.
+      const bool want_keep_alive =
+        _currentVersion >= 1 && !header(F("Connection")).equalsIgnoreCase(F("close"));
+      size_t patched = want_keep_alive ? patch_keep_alive(b, l) : 0;
+      if (patched) {
+        _held = _currentClient; // keep the socket alive past this response
+        return WebServer::_currentClientWrite(_patched, patched);
+      }
+    }
+    return WebServer::_currentClientWrite(b, l);
+  }
+
+private:
+  // Replace "Connection: close" with "Connection: keep-alive" in a copy of the
+  // header block. Returns the new length, or 0 when the token is absent or the
+  // copy would not fit.
+  size_t patch_keep_alive(const char *b, size_t l) {
+    static const char kClose[] = "Connection: close";
+    static const char kKeep[] = "Connection: keep-alive";
+    const size_t kCloseLen = sizeof(kClose) - 1;   // 17
+    const size_t kGrow = sizeof(kKeep) - sizeof(kClose); // +5 bytes
+
+    const char *hit = nullptr;
+    for (size_t i = 0; i + kCloseLen <= l; i++) {
+      if (b[i] == 'C' && memcmp(b + i, kClose, kCloseLen) == 0) {
+        hit = b + i;
+        break;
+      }
+    }
+    if (!hit || l + kGrow > sizeof(_patched)) {
+      return 0;
+    }
+
+    size_t head = (size_t)(hit - b);
+    memcpy(_patched, b, head);
+    memcpy(_patched + head, kKeep, sizeof(kKeep) - 1);
+    memcpy(_patched + head + (sizeof(kKeep) - 1), b + head + kCloseLen, l - head - kCloseLen);
+    return l + kGrow;
+  }
+
+  char _patched[512]; // response header blocks are ~100 bytes
+  NetworkClient _held;      // set while a response promised keep-alive
+  unsigned long _idle_since_ms = 0;
+};
+
+static KeepAliveWebServer server(80);
 
 // NOTE: All movement control now lives in the RTOS control task defined in
 // motor.h. The web UI only sets shared parameters and start/stop flags; it no
@@ -38,20 +158,37 @@ static void handleStop() {
 
 // One-shot trigger: a single pull->release cycle on one side only. The control
 // task starts it on its next cycle if idle; it is ignored while running,
-// tight, or a one-shot is already in progress.
+// tight, or a one-shot is already in progress. While the one-shot safety switch
+// is off (the default) the request is refused with 403 — see /set_oneshot.
 static void handleOneshotLeft() {
-  motor_oneshot(ONESHOT_LEFT);
+  if (!motor_oneshot(ONESHOT_LEFT)) {
+    server.send(403, "text/plain", "left one-shot disabled (safety switch off)");
+    return;
+  }
   server.send(200, "text/plain", "left one-shot queued");
 }
 
 static void handleOneshotRight() {
-  motor_oneshot(ONESHOT_RIGHT);
+  if (!motor_oneshot(ONESHOT_RIGHT)) {
+    server.send(403, "text/plain", "right one-shot disabled (safety switch off)");
+    return;
+  }
   server.send(200, "text/plain", "right one-shot queued");
 }
 
-// Tight mode: while active the control task streams TIGHT_DUTY (duty loop) to
-// both motors via comm_can_set_duty(). Stop sends a one-shot duty 0 so the
-// controllers don't keep driving after tight mode ends.
+// One-shot safety switch: ?on=1 enables the one-shot buttons, ?on=0 (the
+// default) disables them entirely — pending requests are dropped and an
+// in-progress cycle is aborted with the interrupt-style stop.
+static void handleSetOneshot() {
+  bool on = server.hasArg("on") && server.arg("on").toInt() != 0;
+  motor_oneshot_enable(on);
+  server.send(200, "text/plain", on ? "one-shot enabled" : "one-shot disabled");
+}
+
+// Tight mode: while active the control task streams the configured duty
+// (params "tight", duty loop) to both motors via comm_can_set_duty(). Stop
+// sends a one-shot duty 0 so the controllers don't keep driving after tight
+// mode ends.
 static void handleTightStart() {
   g_tight = true;
   server.send(200, "text/plain", "tight start");
@@ -98,6 +235,8 @@ static void handleSetPara() {
   // shared
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
   if (server.hasArg("overlap"))        p.overlap_ms = constrain(server.arg("overlap").toInt(), 0, 5000);
+  // tight mode duty cycle: 0..1.0
+  if (server.hasArg("tight"))          p.tight_duty = constrain(server.arg("tight").toFloat(), 0.0f, TIGHT_DUTY_MAX);
   // equation mode inputs
   if (server.hasArg("eq_T"))           p.T    = server.arg("eq_T").toFloat();
   if (server.hasArg("eq_SL"))          p.SL   = server.arg("eq_SL").toFloat();
@@ -168,6 +307,16 @@ static void handleStatus() {
   s += "\ncooldown="; s += p.cooldown_ms;
   s += "\noverlap="; s += p.overlap_ms;
   s += " ms\n";
+  // Tight mode duty cycle (0..1) — parsed by the page to auto-populate its
+  // slider. Fixed decimals so the value regex always matches.
+  char dutyline[32];
+  snprintf(dutyline, sizeof(dutyline), "tight=%.3f", p.tight_duty);
+  s += dutyline;
+  s += "\n";
+  // One-shot safety switch state (0 = disabled, the default). The page greys
+  // out the one-shot buttons from this.
+  s += "oneshot_enabled="; s += motor_oneshot_enabled() ? 1 : 0;
+  s += "\n";
   // Equation mode inputs (always shown so the form can auto-populate).
   char eqline[48];
   snprintf(eqline, sizeof(eqline), "eq_T=%.3f",   p.T);    s += "\n"; s += eqline;
@@ -251,6 +400,7 @@ static void webserver_init() {
   server.on("/stop", HTTP_GET, handleStop);
   server.on("/oneshot_left", HTTP_GET, handleOneshotLeft);
   server.on("/oneshot_right", HTTP_GET, handleOneshotRight);
+  server.on("/set_oneshot", HTTP_GET, handleSetOneshot);
   server.on("/tight_start", HTTP_GET, handleTightStart);
   server.on("/tight_stop", HTTP_GET, handleTightStop);
   server.on("/set_origin_left", HTTP_GET, handleSetOriginLeft);
@@ -259,6 +409,12 @@ static void webserver_init() {
   server.on("/set_mode", HTTP_GET, handleSetMode);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/wifi", HTTP_GET, handleWifi);
+
+  // KeepAliveWebServer reads the client's own "Connection" header to decide
+  // whether a response may promise keep-alive, so it has to be collected.
+  static const char *kCollectedHeaders[] = {"Connection"};
+  server.collectHeaders(kCollectedHeaders, 1);
+
   server.begin();
 }
 

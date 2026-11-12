@@ -174,6 +174,11 @@ static inline bool mode_is_velocity(motor_mode_t m) {
   return m == MODE_RPM || m == MODE_EQUATION;
 }
 
+// Default duty applied to both motors while tight mode is active (duty loop,
+// 0..1). Runtime-adjustable from the web UI via motor_params_t::tight_duty.
+#define TIGHT_DUTY 0.03f
+#define TIGHT_DUTY_MAX 1.0f
+
 typedef struct {
   // --- "To Pos" group (R->Pos and L->Pos phases) ---
   float    pos;            // target position magnitude (deg), position modes only
@@ -192,6 +197,10 @@ typedef struct {
   uint32_t overlap_ms;
   // --- control mode (exactly one active at a time) ---
   motor_mode_t mode;          // MODE_POS_SPD / MODE_RPM / MODE_EQUATION / MODE_POS
+  // --- tight mode duty (duty loop magnitude, 0..TIGHT_DUTY_MAX) ---
+  // Runtime-adjustable from the web UI; the control task streams +/- this
+  // value to the two motors while tight mode is active.
+  float    tight_duty;
   // --- equation mode inputs (gait geometry, eq8-eq14) ---
   float    T;                 // gait cycle period (s)
   float    SL;                // step length (cm)
@@ -220,6 +229,7 @@ static motor_params_t g_params = {
   .cooldown_ms = 0,
   .overlap_ms = 0,
   .mode = MODE_POS_SPD,
+  .tight_duty = TIGHT_DUTY,
   .T = 1.78f,
   .SL = 49.4f,
   .L = 100.0f,
@@ -284,8 +294,8 @@ static void motor_equation_compute(motor_params_t *p) {
 //                  the target (pure position control, no time limit — STOP or
 //                  the CAN watchdog are the abort mechanisms).
 //   position loop: comm_can_set_pos(target) to the active motor only — no speed,
-//                  no acceleration and NO time constant at all. Like pos+spd, a
-//                  phase ends ONLY when |pos - target| <= APPROACH_TOL_DEG.
+//                  no acceleration and no phase time limit — a phase ends
+//                  ONLY when |pos - target| <= APPROACH_TOL_DEG.
 //   speed-only   : comm_can_set_rpm(signed |Spd|) to the active motor and
 //                  comm_can_set_rpm(0) to the other one every cycle (a velocity
 //                  loop holds its last target, so the idle motor must be held).
@@ -333,6 +343,14 @@ static volatile bool     g_tight = false;     // set by web TIGHT start/stop
 static volatile uint8_t  g_oneshot_req = 0;    // 0 = none, set by web
 static uint8_t           g_oneshot_active = 0; // one-shot cycle in progress
 
+// One-shot safety switch (web UI, OFF by default). While disabled the web
+// handler rejects every one-shot request and the control task refuses to start
+// one, so an accidental click can never move a motor. Turning the switch off
+// also drops any pending request and aborts an in-progress one-shot cycle
+// (motor_oneshot_enable) — the control task then falls into its interrupt-style
+// stop branch and cuts torque on the next cycle.
+static volatile bool g_oneshot_enabled = false;
+
 static motor_phase_t     g_phase = PHASE_IDLE;
 static motor_phase_t     g_next_phase = PHASE_R_TO_POS; // where a cooldown leads
 static uint32_t          g_phase_start_ms = 0; // when the current phase began
@@ -358,9 +376,6 @@ static uint8_t           g_brake_mask = 0;
 // position up on the next lift. Cleared when the motor arrives, when a lift
 // (own phase or overlap) takes over, and on stop / CAN watchdog.
 static uint8_t           g_release_pending = 0;
-
-// Duty applied to both motors while tight mode is active (duty loop, 0..1).
-#define TIGHT_DUTY 0.03f
 
 // Position tolerance (deg) used to decide that a motor has "approached" its
 // target. A motor counts as arrived when |pos - target| <= this value OR the
@@ -557,7 +572,10 @@ static void control_task(void *arg) {
     // Starts a single pull->release cycle on the requested side: to-Pos (reel
     // in / 收繩) then to-Zero (release / 放繩), then back to Idle. The other
     // side is never commanded.
-    if (g_oneshot_req != 0 && !g_running && !g_tight && !g_can_error &&
+    // The safety switch gates starting a cycle; once a cycle is running it
+    // always finishes (turning the switch off mid-cycle is handled by
+    // motor_oneshot_enable, which aborts it).
+    if (g_oneshot_enabled && g_oneshot_req != 0 && !g_running && !g_tight && !g_can_error &&
         g_oneshot_active == 0 && g_phase == PHASE_IDLE) {
       g_oneshot_active = g_oneshot_req;
       g_oneshot_req = 0;
@@ -566,10 +584,16 @@ static void control_task(void *arg) {
     }
 
     if (g_tight && !g_can_error) {
-      // Tight mode: hold both motors at TIGHT_DUTY continuously.
+      // Tight mode: hold both motors at the configured duty continuously.
       // Bypasses the movement state machine while active; it resumes on stop.
-      motor_cmd_duty(MOTOR_LEFT_CAN_ID, TIGHT_DUTY);
-      motor_cmd_duty(MOTOR_RIGHT_CAN_ID, -TIGHT_DUTY);
+      // The duty is re-read every cycle, so the web slider applies live.
+      motor_params_t tp;
+      motor_params_get(&tp);
+      float duty = tp.tight_duty;
+      if (duty < 0.0f) duty = 0.0f;
+      if (duty > TIGHT_DUTY_MAX) duty = TIGHT_DUTY_MAX;
+      motor_cmd_duty(MOTOR_LEFT_CAN_ID, duty);
+      motor_cmd_duty(MOTOR_RIGHT_CAN_ID, -duty);
     } else if ((g_running || g_oneshot_active) && !g_can_error) {
       motor_params_t p;
       motor_params_get(&p);
@@ -915,8 +939,29 @@ void motor_control_run(bool run) {
 
 // Web UI: request a one-shot pull->release cycle on one side
 // (ONESHOT_LEFT / ONESHOT_RIGHT). Ignored unless the system is fully idle;
-// consumed by the control task on its next cycle.
-void motor_oneshot(uint8_t side) { g_oneshot_req = side; }
+// consumed by the control task on its next cycle. While the one-shot safety
+// switch is off (the default) the request is refused outright — returns false
+// so the web handler can report it.
+bool motor_oneshot(uint8_t side) {
+  if (!g_oneshot_enabled) return false;
+  g_oneshot_req = side;
+  return true;
+}
+
+// Web UI: one-shot safety switch (OFF by default). Turning it off drops any
+// pending request and aborts an in-progress cycle: clearing the active flag
+// makes the control task fall into its interrupt-style stop branch (0 A to both
+// motors) on the next cycle, exactly like STOP.
+void motor_oneshot_enable(bool on) {
+  g_oneshot_enabled = on;
+  if (!on) {
+    g_oneshot_req = 0;
+    g_oneshot_active = 0;
+  }
+}
+
+// Web UI: is the one-shot feature enabled?
+bool motor_oneshot_enabled() { return g_oneshot_enabled; }
 
 // Web UI / watchdog accessor: true while any CAN feedback is missing.
 bool motor_can_error() { return g_can_error != 0; }
