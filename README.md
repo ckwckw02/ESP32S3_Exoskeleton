@@ -25,7 +25,7 @@ Wi-Fi, BT 5 (LE), Dual Core + LP Core, 240MHz, Embedded PSRAM 8MB (AP_3v3)
 - **USB Mode:** "Hardware CDC and JTAG"
 
 ## Build
-Sketch uses 976246 bytes (11%) of program storage space. Maximum is 8257536 bytes.
+Sketch uses 974786 bytes (11%) of program storage space. Maximum is 8257536 bytes.
 
-Global variables use 47724 bytes (14%) of dynamic memory, leaving 279956 bytes for local variables. Maximum is 327680 bytes.
+Global variables use 47156 bytes (14%) of dynamic memory, leaving 280524 bytes for local variables. Maximum is 327680 bytes.
 

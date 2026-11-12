@@ -174,10 +174,12 @@ static inline bool mode_is_velocity(motor_mode_t m) {
   return m == MODE_RPM || m == MODE_EQUATION;
 }
 
-// Default duty applied to both motors while tight mode is active (duty loop,
-// 0..1). Runtime-adjustable from the web UI via motor_params_t::tight_duty.
+// Default duty applied to both motors while tight mode is active (duty loop).
+// Runtime-adjustable from the web UI via motor_params_t::tight_duty, capped at
+// TIGHT_DUTY_MAX — deliberately low (0.1): tight mode only takes up the cable
+// slack, and a higher duty would wind the exoskeleton against a wearer's limb.
 #define TIGHT_DUTY 0.03f
-#define TIGHT_DUTY_MAX 1.0f
+#define TIGHT_DUTY_MAX 0.1f
 
 typedef struct {
   // --- "To Pos" group (R->Pos and L->Pos phases) ---

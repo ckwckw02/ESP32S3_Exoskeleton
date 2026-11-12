@@ -28,7 +28,7 @@ static const char INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Motor Control 2026-11-12</h1>
+  <h1>Motor Control 2026-11-12-9PM</h1>
 
   <div class="floatbar">
     <div class="canerr" id="canerr"></div>
@@ -70,18 +70,19 @@ static const char INDEX_HTML[] = R"rawliteral(
 
   <div class="section">
     <h2>Origin</h2>
+    <button class="origin" onclick="cmd('/set_origin_both')">Set BOTH</button>
     <button class="origin" onclick="cmd('/set_origin_left')">Set LEFT</button>
     <button class="origin" onclick="cmd('/set_origin_right')">Set RIGHT</button>
   </div>
 
   <div class="section">
     <h2>Tight</h2>
-    <label>Duty cycle (0 &ndash; 1.0)</label>
+    <label>Duty cycle (0 &ndash; 0.1)</label>
     <div style="display:flex; align-items:center;">
-      <input type="range" id="tight_range" min="0" max="1" step="0.01" value="0.03"
-             oninput="setTightDuty(this.value, 'range')" style="width:100%; margin:0 8px 0 0;">
-      <input type="number" id="tight" step="0.01" min="0" max="1" value="0.03"
-             onchange="setTightDuty(this.value, 'num')" style="width:80px; margin:0;">
+      <input type="range" id="tight_range" min="0" max="0.1" step="0.001" value="0.03"
+             oninput="setTightDuty(this.value)" style="width:100%; margin:0 8px 0 0;">
+      <input type="number" id="tight" step="0.001" min="0" max="0.1" value="0.03"
+             onchange="setTightDuty(this.value)" style="width:80px; margin:0;">
     </div>
     <p style="margin:6px 0 0; font-size:0.85em; color:#666;">Applies immediately, also while tight mode is running.</p>
     <button class="start" onclick="cmd('/tight_start')">Start</button>
@@ -223,27 +224,43 @@ static const char INDEX_HTML[] = R"rawliteral(
         box.style.pointerEvents = on ? '' : 'none';
       }
     }
-    // Tight duty cycle (0..1.0): keep the slider and the number box in sync and
+    // Tight duty cycle (0..0.1): keep the slider and the number box in sync and
     // push the value immediately so it also applies while tight mode runs.
-    // src: 'range' when the slider moved, 'num' when the number box did.
+    var TIGHT_MAX = 0.1;
     var tightTouched = false;
-    function setTightDuty(v, src) {
+    function setTightDuty(v) {
       var d = parseFloat(v);
       if (isNaN(d)) return;
       if (d < 0) d = 0;
-      if (d > 1) d = 1;
+      if (d > TIGHT_MAX) d = TIGHT_MAX;
       var rg = document.getElementById('tight_range');
       var nb = document.getElementById('tight');
-      if (src === 'range') { if (nb) nb.value = d; }
-      else { if (rg) rg.value = d; }
+      // Snap BOTH controls to the clamped value so the number box never shows
+      // an out-of-range figure that differs from what is actually applied.
+      if (rg) rg.value = d;
+      if (nb) nb.value = d;
       tightTouched = true;
       fetch('/set_para?tight=' + encodeURIComponent(d)).catch(function () {});
     }
     // Show/hide the sections and fields that don't apply to this mode.
-    // modeId: 0 = pos+spd (pure position: no time fields, no overlap),
-    // 1 = RPM (hide pos + RPA, show overlap),
-    // 2 = equation (hide Motor Parameters, show Equation + overlap sections),
-    // 3 = position loop (only Pos applies: no Spd, no RPA, no time, no overlap).
+    // Each parameter field is visible only in the modes listed in FIELD_MODES.
+    // modeId: 0 = pos+spd (Position Velocity Loop), 1 = velocity loop (RPM),
+    // 2 = equation (whole Motor Parameters group hidden), 3 = position loop.
+    //   pos:           Position Velocity (0) + Position Loop (3)
+    //   spd_pos/zero:  Position Velocity (0) + Velocity Loop (1)
+    //   rpa_pos/zero:  Position Velocity (0) only — RPA is the pos_spd
+    //                  acceleration field; the velocity loop has no RPA, so it
+    //                  must stay hidden in Velocity Loop mode.
+    //   approach_*:    Velocity Loop (1) only (phase nominal times)
+    var FIELD_MODES = {
+      pos:           [0, 3],
+      spd_pos:       [0, 1],
+      rpa_pos:       [0],
+      approach_pos:  [1],
+      spd_zero:      [0, 1],
+      rpa_zero:      [0],
+      approach_zero: [1]
+    };
     function applyModeUI(modeId) {
       // para_section + overlap_section are one group: hidden in equation mode.
       var paraGrp = document.getElementById('para_group');
@@ -252,33 +269,14 @@ static const char INDEX_HTML[] = R"rawliteral(
       if (eqSec) eqSec.style.display = (modeId === 2) ? '' : 'none';
       var ovSec = document.getElementById('overlap_section');
       if (ovSec) ovSec.style.display = (modeId === 1) ? '' : 'none';
-      // In RPM mode the pos + RPA fields don't apply; restore them otherwise.
-      var rpmHide = [['pos','lbl_pos'], ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
-      for (var i = 0; i < rpmHide.length; i++) {
-        var el = document.getElementById(rpmHide[i][0]);
-        if (el) el.style.display = (modeId === 1) ? 'none' : '';
-        var lb = document.getElementById(rpmHide[i][1]);
-        if (lb) lb.style.display = (modeId === 1) ? 'none' : '';
-      }
-      // In pos+spd mode the phase time fields don't apply (pure position
-      // control); restore them in RPM mode. They never apply in position-loop
-      // mode either (no time constant).
-      var spdHide = [['approach_pos','lbl_approach_pos'], ['approach_zero','lbl_approach_zero']];
-      for (var j = 0; j < spdHide.length; j++) {
-        var el2 = document.getElementById(spdHide[j][0]);
-        if (el2) el2.style.display = (modeId === 0 || modeId === 3) ? 'none' : '';
-        var lb2 = document.getElementById(spdHide[j][1]);
-        if (lb2) lb2.style.display = (modeId === 0 || modeId === 3) ? 'none' : '';
-      }
-      // Position-loop mode: comm_can_set_pos takes only a target position, so
-      // the Spd and RPA fields don't apply.
-      var posHide = [['spd_pos','lbl_spd_pos'], ['spd_zero','lbl_spd_zero'],
-                     ['rpa_pos','lbl_rpa_pos'], ['rpa_zero','lbl_rpa_zero']];
-      for (var k2 = 0; k2 < posHide.length; k2++) {
-        var el3 = document.getElementById(posHide[k2][0]);
-        if (el3) el3.style.display = (modeId === 3) ? 'none' : '';
-        var lb3 = document.getElementById(posHide[k2][1]);
-        if (lb3) lb3.style.display = (modeId === 3) ? 'none' : '';
+      // Show each field (and its lbl_<id> label) only in its applicable modes.
+      for (var id in FIELD_MODES) {
+        if (!FIELD_MODES.hasOwnProperty(id)) continue;
+        var show = FIELD_MODES[id].indexOf(modeId) !== -1;
+        var el = document.getElementById(id);
+        if (el) el.style.display = show ? '' : 'none';
+        var lb = document.getElementById('lbl_' + id);
+        if (lb) lb.style.display = show ? '' : 'none';
       }
     }
     // Stop auto-filling the inputs once the user starts editing them.

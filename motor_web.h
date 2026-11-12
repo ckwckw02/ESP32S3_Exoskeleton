@@ -14,127 +14,13 @@ static const char *WIFI_SSID = "MotorControl";
 static const char *WIFI_PASS = "12345678";
 
 // ---- Web server (port 80) ----
-// HTTP/1.1 keep-alive web server.
-//
-// The stock WebServer always answers with "Connection: close" and releases the
-// TCP connection right after each response, so every one of the page's /status
-// polls (every 100 ms) pays a fresh connect + teardown. This subclass answers
-// "Connection: keep-alive" instead and keeps the connection open, which removes
-// that per-request latency.
-//
-// How it hooks the library without duplicating its connection state machine:
-//   * _currentClientWrite() is the single choke point every response passes
-//     through, and a response's whole header block arrives there as one
-//     contiguous buffer starting with the status line — so the token can be
-//     swapped in a private copy (content writes never match).
-//   * The base handleClient() releases _currentClient at the end of the very
-//     call that sent the response. Holding our own NetworkClient copy across
-//     that call keeps the socket's shared handle alive, so "releasing" is a
-//     no-op and the same connection can be handed back and re-armed in
-//     HC_WAIT_READ for the next pipelined request.
-//   * The idle hold is deliberately short (KEEP_ALIVE_IDLE_MS) and always
-//     shorter than a browser's own keep-alive timeout, so the server closes
-//     first and the client never writes into a half-closed socket.
-// A client that asks for "Connection: close" gets exactly that, and anything
-// that cannot be rewritten is sent untouched (still closing) — always safe.
-//
-// Trade-off: like the stock server this handles one connection at a time, so a
-// held connection blocks another client for up to KEEP_ALIVE_IDLE_MS after the
-// last request. The page polls every 100 ms, so the timeout never fires while
-// the page is open; it only reclaims the slot once the browser goes away.
-#define KEEP_ALIVE_IDLE_MS 1500
-
-class KeepAliveWebServer : public WebServer {
-public:
-  explicit KeepAliveWebServer(int port) : WebServer(port) {}
-
-  void handleClient() override {
-    // Keep a reference to the socket the response was written to: the base
-    // class drops _currentClient at the end of this same call.
-    _held = NetworkClient();
-    WebServer::handleClient();
-    const bool responded = (bool)_held; // a keep-alive response just went out
-
-    if (_held) {
-      _currentClient = _held;
-      _currentStatus = HC_WAIT_READ;
-      _statusChange = millis();
-      _held = NetworkClient(); // _currentClient owns the socket again
-    }
-
-    if (_currentStatus != HC_WAIT_READ || !_currentClient) {
-      _idle_since_ms = millis(); // not holding a connection open
-      return;
-    }
-
-    // Activity (a response just went out, or a new request is pending) restarts
-    // the idle timer; otherwise close once it expires so another client can take
-    // the single connection slot, and so the browser never reuses a connection
-    // the network stack has already dropped.
-    if (responded || _currentClient.available()) {
-      _idle_since_ms = millis();
-    } else if ((millis() - _idle_since_ms) > KEEP_ALIVE_IDLE_MS) {
-      _currentClient.stop();
-      _currentClient = NetworkClient();
-      _currentStatus = HC_NONE;
-      _idle_since_ms = millis();
-    }
-  }
-
-protected:
-  size_t _currentClientWrite(const char *b, size_t l) override {
-    // Only response header blocks start with the status line, so content
-    // writes (which could legitimately contain the token) are never touched.
-    if (l > 8 && l < sizeof(_patched) - 8 && memcmp(b, "HTTP/1.", 7) == 0) {
-      // The request is already parsed at this point, so the client's own
-      // "Connection" preference is readable (webserver_init collects it).
-      // Keep-alive is promised only to HTTP/1.1+ clients that did not ask to
-      // close; everything else keeps the stock "Connection: close" behaviour.
-      const bool want_keep_alive =
-        _currentVersion >= 1 && !header(F("Connection")).equalsIgnoreCase(F("close"));
-      size_t patched = want_keep_alive ? patch_keep_alive(b, l) : 0;
-      if (patched) {
-        _held = _currentClient; // keep the socket alive past this response
-        return WebServer::_currentClientWrite(_patched, patched);
-      }
-    }
-    return WebServer::_currentClientWrite(b, l);
-  }
-
-private:
-  // Replace "Connection: close" with "Connection: keep-alive" in a copy of the
-  // header block. Returns the new length, or 0 when the token is absent or the
-  // copy would not fit.
-  size_t patch_keep_alive(const char *b, size_t l) {
-    static const char kClose[] = "Connection: close";
-    static const char kKeep[] = "Connection: keep-alive";
-    const size_t kCloseLen = sizeof(kClose) - 1;   // 17
-    const size_t kGrow = sizeof(kKeep) - sizeof(kClose); // +5 bytes
-
-    const char *hit = nullptr;
-    for (size_t i = 0; i + kCloseLen <= l; i++) {
-      if (b[i] == 'C' && memcmp(b + i, kClose, kCloseLen) == 0) {
-        hit = b + i;
-        break;
-      }
-    }
-    if (!hit || l + kGrow > sizeof(_patched)) {
-      return 0;
-    }
-
-    size_t head = (size_t)(hit - b);
-    memcpy(_patched, b, head);
-    memcpy(_patched + head, kKeep, sizeof(kKeep) - 1);
-    memcpy(_patched + head + (sizeof(kKeep) - 1), b + head + kCloseLen, l - head - kCloseLen);
-    return l + kGrow;
-  }
-
-  char _patched[512]; // response header blocks are ~100 bytes
-  NetworkClient _held;      // set while a response promised keep-alive
-  unsigned long _idle_since_ms = 0;
-};
-
-static KeepAliveWebServer server(80);
+// Plain WebServer: every response closes its TCP connection ("Connection:
+// close"). This is deliberate — the stock server handles one connection at a
+// time, and two IMU devices drive this board concurrently. Closing after each
+// request means neither client can hold the single slot open and starve the
+// other, so both devices stay responsive. (An earlier keep-alive variant held
+// the connection idle for up to 1.5 s, which blocked the second device.)
+static WebServer server(80);
 
 // NOTE: All movement control now lives in the RTOS control task defined in
 // motor.h. The web UI only sets shared parameters and start/stop flags; it no
@@ -218,6 +104,18 @@ static void handleSetOriginRight() {
   server.send(200, "text/plain", "right origin set");
 }
 
+// Set both origins in one action: both origin frames go out under a single CAN
+// TX lock, so they are sent back-to-back with the control task's TX serialised
+// against them (no interleaving), and neither motor can be left un-zeroed by a
+// missed second request.
+static void handleSetOriginBoth() {
+  xSemaphoreTake(can_tx_mux, portMAX_DELAY);
+  comm_can_set_origin(MOTOR_LEFT_CAN_ID, 0);
+  comm_can_set_origin(MOTOR_RIGHT_CAN_ID, 0);
+  xSemaphoreGive(can_tx_mux);
+  server.send(200, "text/plain", "both origins set");
+}
+
 static void handleSetPara() {
   // Build a full parameter snapshot (unspecified fields keep current values).
   motor_params_t p;
@@ -235,7 +133,7 @@ static void handleSetPara() {
   // shared
   if (server.hasArg("cooldown"))       p.cooldown_ms = constrain(server.arg("cooldown").toInt(), 0, 60000);
   if (server.hasArg("overlap"))        p.overlap_ms = constrain(server.arg("overlap").toInt(), 0, 5000);
-  // tight mode duty cycle: 0..1.0
+  // tight mode duty cycle: 0..TIGHT_DUTY_MAX (0.1)
   if (server.hasArg("tight"))          p.tight_duty = constrain(server.arg("tight").toFloat(), 0.0f, TIGHT_DUTY_MAX);
   // equation mode inputs
   if (server.hasArg("eq_T"))           p.T    = server.arg("eq_T").toFloat();
@@ -405,16 +303,11 @@ static void webserver_init() {
   server.on("/tight_stop", HTTP_GET, handleTightStop);
   server.on("/set_origin_left", HTTP_GET, handleSetOriginLeft);
   server.on("/set_origin_right", HTTP_GET, handleSetOriginRight);
+  server.on("/set_origin_both", HTTP_GET, handleSetOriginBoth);
   server.on("/set_para", HTTP_GET, handleSetPara);
   server.on("/set_mode", HTTP_GET, handleSetMode);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/wifi", HTTP_GET, handleWifi);
-
-  // KeepAliveWebServer reads the client's own "Connection" header to decide
-  // whether a response may promise keep-alive, so it has to be collected.
-  static const char *kCollectedHeaders[] = {"Connection"};
-  server.collectHeaders(kCollectedHeaders, 1);
-
   server.begin();
 }
 
